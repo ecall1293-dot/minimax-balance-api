@@ -18,147 +18,93 @@ def root():
     return {"ok": True, "message": "service is running"}
 
 
-def safe_wait(page, ms=3000):
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:
-        pass
-    try:
-        page.wait_for_load_state("load", timeout=15000)
-    except Exception:
-        pass
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-    page.wait_for_timeout(ms)
-
-
-def extract_balance_only_on_target_page(text: str):
-    """
-    クレジットページでしか抽出しない前提の抽出関数。
-    誤爆しやすい単純な数値抽出はしない。
-    """
+def extract_balance(text: str):
     patterns = [
         r"([0-9][0-9,\.]*)\s*credits",
         r"Remaining Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Available Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Credits Remaining[^0-9]*([0-9][0-9,\.]*)",
     ]
-
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            value = m.group(1).strip()
-            return f"{value} credits"
-
+            return f"{m.group(1).strip()} credits"
     return None
-
-
-def get_balance_page():
-    if not EMAIL or not PASSWORD:
-        raise Exception("MINIMAX_EMAIL or MINIMAX_PASSWORD is empty")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-software-rasterizer",
-            ],
-        )
-
-        context = browser.new_context(viewport={"width": 1280, "height": 800})
-        page = context.new_page()
-
-        try:
-            # 1. ログインページを開く
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            safe_wait(page, 2000)
-
-            page.wait_for_selector("#mail", timeout=60000)
-            page.wait_for_selector("#password", timeout=60000)
-
-            page.fill("#mail", EMAIL)
-            page.fill("#password", PASSWORD)
-            page.get_by_role("button", name="Sign in").click()
-
-            # 2. ログイン後、user-center配下に来るのを待つ
-            page.wait_for_url("**/user-center/**", timeout=60000)
-            safe_wait(page, 4000)
-
-            # 3. 目的ページへ移動
-            page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=60000)
-            safe_wait(page, 5000)
-
-            current_url = page.url
-
-            try:
-                title = page.title()
-            except Exception:
-                title = "(title unavailable)"
-
-            try:
-                page.wait_for_selector("body", timeout=10000)
-            except Exception:
-                pass
-
-            safe_wait(page, 3000)
-
-            body_text = page.locator("body").inner_text()
-
-            return {
-                "title": title,
-                "url": current_url,
-                "text": body_text,
-            }
-
-        finally:
-            browser.close()
 
 
 @app.get("/balance")
 def balance():
     try:
-        result = get_balance_page()
-        title = result["title"]
-        url = result["url"]
-        text = result["text"]
-
-        # 目的URLに到達していないなら抽出しない
-        if "audio-subscription" not in url:
+        if not EMAIL or not PASSWORD:
             return {
                 "ok": False,
-                "balance": "not found",
-                "reason": "not on audio subscription page",
-                "title": title,
-                "url": url,
-                "preview": text[:3000],
+                "error": "MINIMAX_EMAIL or MINIMAX_PASSWORD is empty"
             }
 
-        extracted = extract_balance_only_on_target_page(text)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-software-rasterizer",
+                ],
+            )
 
-        if extracted:
-            return {
-                "ok": True,
-                "balance": extracted,
-                "title": title,
-                "url": url,
-            }
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
 
-        return {
-            "ok": False,
-            "balance": "not found",
-            "reason": "balance text not matched",
-            "title": title,
-            "url": url,
-            "preview": text[:3000],
-        }
+            try:
+                # login
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_selector("#mail", timeout=45000)
+                page.wait_for_selector("#password", timeout=45000)
+
+                page.fill("#mail", EMAIL)
+                page.fill("#password", PASSWORD)
+                page.get_by_role("button", name="Sign in").click()
+
+                # login complete
+                page.wait_for_url("**/user-center/**", timeout=45000)
+                page.wait_for_timeout(3000)
+
+                # target page
+                page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(5000)
+
+                current_url = page.url
+                body_text = page.locator("body").inner_text()
+
+                # wrong page guard
+                if "audio-subscription" not in current_url:
+                    return {
+                        "ok": False,
+                        "reason": "not on audio subscription page",
+                        "url": current_url,
+                        "preview": body_text[:3000],
+                    }
+
+                found = extract_balance(body_text)
+                if found:
+                    return {
+                        "ok": True,
+                        "balance": found,
+                        "url": current_url,
+                    }
+
+                return {
+                    "ok": False,
+                    "reason": "balance text not matched",
+                    "url": current_url,
+                    "preview": body_text[:3000],
+                }
+
+            finally:
+                browser.close()
 
     except Exception as e:
         return {
