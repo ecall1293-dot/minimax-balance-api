@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import os
 import re
 import traceback
@@ -19,7 +19,6 @@ def root():
 
 
 def extract_balance(text: str):
-
     patterns = [
         r"([0-9][0-9,\.]*)\s*credits",
         r"Remaining[^0-9]*([0-9][0-9,\.]*)",
@@ -38,13 +37,23 @@ def extract_balance(text: str):
     return None
 
 
-def get_balance_page():
+def safe_wait(page):
+    # SPA対策。load_stateは失敗しても続行
+    for state in ["domcontentloaded", "load", "networkidle"]:
+        try:
+            page.wait_for_load_state(state, timeout=15000)
+        except Exception:
+            pass
 
+    # 追加待機
+    page.wait_for_timeout(3000)
+
+
+def get_balance_page():
     if not EMAIL or not PASSWORD:
         raise Exception("MINIMAX_EMAIL or MINIMAX_PASSWORD is empty")
 
     with sync_playwright() as p:
-
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -65,11 +74,7 @@ def get_balance_page():
         page = context.new_page()
 
         try:
-
-            # -------------------------
             # ログインページ
-            # -------------------------
-
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
             page.wait_for_selector("#mail", timeout=60000)
@@ -80,30 +85,43 @@ def get_balance_page():
 
             page.get_by_role("button", name="Sign in").click()
 
-            # ログイン成功待機
+            # ログイン完了待機
             page.wait_for_url("**/user-center/**", timeout=60000)
+            safe_wait(page)
 
-            page.wait_for_load_state("networkidle")
-
-            # -------------------------
-            # 残高ページへ移動
-            # -------------------------
-
+            # 残高ページへ
             page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=60000)
+            safe_wait(page)
 
-            page.wait_for_load_state("networkidle")
+            # ここでさらにSPA遷移しても落ちにくくする
+            current_url = page.url
 
-            page.wait_for_timeout(4000)
+            # title取得は失敗してもURLだけ返せば十分
+            try:
+                title = page.title()
+            except Exception:
+                title = "(title unavailable)"
 
-            title = page.title()
-            url = page.url
+            # body取得前にも少し待つ
+            try:
+                page.wait_for_selector("body", timeout=10000)
+            except Exception:
+                pass
 
-            body_text = page.locator("body").inner_text()
+            safe_wait(page)
+
+            try:
+                body_text = page.locator("body").inner_text(timeout=15000)
+            except TypeError:
+                # 古い互換のため
+                body_text = page.locator("body").inner_text()
+            except Exception:
+                body_text = ""
 
             return {
                 "title": title,
-                "url": url,
-                "text": body_text
+                "url": current_url,
+                "text": body_text,
             }
 
         finally:
@@ -112,9 +130,7 @@ def get_balance_page():
 
 @app.get("/balance")
 def balance():
-
     try:
-
         result = get_balance_page()
 
         text = result["text"]
@@ -128,7 +144,7 @@ def balance():
                 "ok": True,
                 "balance": extracted,
                 "title": title,
-                "url": url
+                "url": url,
             }
 
         return {
@@ -136,13 +152,12 @@ def balance():
             "balance": "not found",
             "title": title,
             "url": url,
-            "preview": text[:3000]
+            "preview": text[:3000],
         }
 
     except Exception as e:
-
         return {
             "ok": False,
             "error": str(e),
-            "trace": traceback.format_exc()
+            "trace": traceback.format_exc(),
         }
