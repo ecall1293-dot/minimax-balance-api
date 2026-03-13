@@ -19,6 +19,7 @@ def root():
 
 
 def extract_balance(text: str):
+
     patterns = [
         r"([0-9][0-9,\.]*)\s*credits",
         r"Remaining[^0-9]*([0-9][0-9,\.]*)",
@@ -26,11 +27,11 @@ def extract_balance(text: str):
         r"Balance[^0-9]*([0-9][0-9,\.]*)",
     ]
 
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            value = m.group(1).strip()
-            if "credit" in p.lower():
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            if "credit" in pattern.lower():
                 return f"{value} credits"
             return value
 
@@ -54,18 +55,21 @@ def get_balance_page():
                 "--disable-background-networking",
                 "--disable-sync",
                 "--disable-software-rasterizer",
-            ]
+            ],
         )
 
         context = browser.new_context(
-            viewport={"width": 1200, "height": 800}
+            viewport={"width": 1280, "height": 800}
         )
 
         page = context.new_page()
 
         try:
 
+            # -------------------------
             # ログインページ
+            # -------------------------
+
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
             page.wait_for_selector("#mail", timeout=60000)
@@ -76,12 +80,20 @@ def get_balance_page():
 
             page.get_by_role("button", name="Sign in").click()
 
-            page.wait_for_timeout(8000)
+            # ログイン成功待機
+            page.wait_for_url("**/user-center/**", timeout=60000)
 
-            # 残高ページ
+            page.wait_for_load_state("networkidle")
+
+            # -------------------------
+            # 残高ページへ移動
+            # -------------------------
+
             page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=60000)
 
-            page.wait_for_timeout(8000)
+            page.wait_for_load_state("networkidle")
+
+            page.wait_for_timeout(4000)
 
             title = page.title()
             url = page.url
@@ -109,12 +121,12 @@ def balance():
         title = result["title"]
         url = result["url"]
 
-        balance = extract_balance(text)
+        extracted = extract_balance(text)
 
-        if balance:
+        if extracted:
             return {
                 "ok": True,
-                "balance": balance,
+                "balance": extracted,
                 "title": title,
                 "url": url
             }
