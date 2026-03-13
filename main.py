@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 import os
 import re
 import traceback
@@ -18,35 +18,41 @@ def root():
     return {"ok": True, "message": "service is running"}
 
 
-def extract_balance(text: str):
+def safe_wait(page, ms=3000):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("load", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(ms)
+
+
+def extract_balance_only_on_target_page(text: str):
+    """
+    クレジットページでしか抽出しない前提の抽出関数。
+    誤爆しやすい単純な数値抽出はしない。
+    """
     patterns = [
         r"([0-9][0-9,\.]*)\s*credits",
-        r"Remaining[^0-9]*([0-9][0-9,\.]*)",
-        r"Available[^0-9]*([0-9][0-9,\.]*)",
-        r"Balance[^0-9]*([0-9][0-9,\.]*)",
+        r"Remaining Credits[^0-9]*([0-9][0-9,\.]*)",
+        r"Available Credits[^0-9]*([0-9][0-9,\.]*)",
+        r"Credits Remaining[^0-9]*([0-9][0-9,\.]*)",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = match.group(1).strip()
-            if "credit" in pattern.lower():
-                return f"{value} credits"
-            return value
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            value = m.group(1).strip()
+            return f"{value} credits"
 
     return None
-
-
-def safe_wait(page):
-    # SPA対策。load_stateは失敗しても続行
-    for state in ["domcontentloaded", "load", "networkidle"]:
-        try:
-            page.wait_for_load_state(state, timeout=15000)
-        except Exception:
-            pass
-
-    # 追加待機
-    page.wait_for_timeout(3000)
 
 
 def get_balance_page():
@@ -67,56 +73,44 @@ def get_balance_page():
             ],
         )
 
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800}
-        )
-
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
 
         try:
-            # ログインページ
+            # 1. ログインページを開く
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            safe_wait(page, 2000)
 
             page.wait_for_selector("#mail", timeout=60000)
             page.wait_for_selector("#password", timeout=60000)
 
             page.fill("#mail", EMAIL)
             page.fill("#password", PASSWORD)
-
             page.get_by_role("button", name="Sign in").click()
 
-            # ログイン完了待機
+            # 2. ログイン後、user-center配下に来るのを待つ
             page.wait_for_url("**/user-center/**", timeout=60000)
-            safe_wait(page)
+            safe_wait(page, 4000)
 
-            # 残高ページへ
+            # 3. 目的ページへ移動
             page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=60000)
-            safe_wait(page)
+            safe_wait(page, 5000)
 
-            # ここでさらにSPA遷移しても落ちにくくする
             current_url = page.url
 
-            # title取得は失敗してもURLだけ返せば十分
             try:
                 title = page.title()
             except Exception:
                 title = "(title unavailable)"
 
-            # body取得前にも少し待つ
             try:
                 page.wait_for_selector("body", timeout=10000)
             except Exception:
                 pass
 
-            safe_wait(page)
+            safe_wait(page, 3000)
 
-            try:
-                body_text = page.locator("body").inner_text(timeout=15000)
-            except TypeError:
-                # 古い互換のため
-                body_text = page.locator("body").inner_text()
-            except Exception:
-                body_text = ""
+            body_text = page.locator("body").inner_text()
 
             return {
                 "title": title,
@@ -132,12 +126,22 @@ def get_balance_page():
 def balance():
     try:
         result = get_balance_page()
-
-        text = result["text"]
         title = result["title"]
         url = result["url"]
+        text = result["text"]
 
-        extracted = extract_balance(text)
+        # 目的URLに到達していないなら抽出しない
+        if "audio-subscription" not in url:
+            return {
+                "ok": False,
+                "balance": "not found",
+                "reason": "not on audio subscription page",
+                "title": title,
+                "url": url,
+                "preview": text[:3000],
+            }
+
+        extracted = extract_balance_only_on_target_page(text)
 
         if extracted:
             return {
@@ -150,6 +154,7 @@ def balance():
         return {
             "ok": False,
             "balance": "not found",
+            "reason": "balance text not matched",
             "title": title,
             "url": url,
             "preview": text[:3000],
