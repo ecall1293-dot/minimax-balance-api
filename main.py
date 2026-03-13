@@ -1,367 +1,163 @@
-import { chromium, Page } from "playwright";
-import fs from "fs";
-import path from "path";
+import re
+import asyncio
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-type MinimaxCreditResult =
-  | {
-      ok: true;
-      balanceText: string;
-      balanceValue: number | null;
-      url: string;
-      usedMethod: string;
-      debugPath?: string;
-    }
-  | {
-      ok: false;
-      reason: string;
-      url: string;
-      usedMethod?: string;
-      afterLoginUrl?: string;
-      preview?: string;
-      debugPath?: string;
-    };
 
-const LOGIN_URL = "https://platform.minimax.io/login";
-const BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information";
-const AUDIO_SUBSCRIPTION_URL =
-  "https://platform.minimax.io/user-center/payment/audio-subscription";
+LOGIN_URL = "https://platform.minimax.io/login"
+AUDIO_URL = "https://platform.minimax.io/user-center/payment/audio-subscription"
 
-function ensureDir(dir: string) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
 
-async function saveDebugFiles(page: Page, prefix = "minimax_debug") {
-  const debugDir = path.resolve(process.cwd(), "debug");
-  ensureDir(debugDir);
+def parse_balance(text: str):
+    text = re.sub(r"\s+", " ", text).strip()
 
-  const now = new Date();
-  const stamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-    "_",
-    String(now.getHours()).padStart(2, "0"),
-    String(now.getMinutes()).padStart(2, "0"),
-    String(now.getSeconds()).padStart(2, "0"),
-  ].join("");
+    patterns = [
+        r"Credit Balance[:\s]*([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
+        r"Available Credit[:\s]*([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
+        r"Balance[:\s]*([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
+    ]
 
-  const base = path.join(debugDir, `${prefix}_${stamp}`);
-  const screenshotPath = `${base}.png`;
-  const htmlPath = `${base}.html`;
-  const txtPath = `${base}.txt`;
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            raw = m.group(1).strip()
+            num = re.sub(r"[^\d.]", "", raw)
+            return {
+                "balanceText": raw,
+                "balanceValue": float(num) if num else None
+            }
 
-  await page.screenshot({ path: screenshotPath, fullPage: true });
-  const html = await page.content();
-  fs.writeFileSync(htmlPath, html, "utf-8");
+    return None
 
-  const bodyText = await page.locator("body").innerText().catch(() => "");
-  fs.writeFileSync(txtPath, bodyText, "utf-8");
 
-  return base;
-}
+async def click_menu_row_by_label(page, label: str):
+    # p要素ではなく、行全体の cursor-pointer div をクリックする
+    row = page.locator(
+        f"div.cursor-pointer:has(p:text-is('{label}'))"
+    ).first
 
-async function logPageSnapshot(page: Page, label: string) {
-  const url = page.url();
-  const title = await page.title().catch(() => "");
-  const bodyText = await page.locator("body").innerText().catch(() => "");
-  console.log(`\n===== ${label} =====`);
-  console.log("URL:", url);
-  console.log("TITLE:", title);
-  console.log("BODY PREVIEW:", bodyText.slice(0, 1200));
-  console.log("====================\n");
-}
+    await row.wait_for(state="visible", timeout=10000)
+    await row.click(force=True)
+    await page.wait_for_timeout(1200)
 
-async function safeClickByText(page: Page, text: string, timeout = 5000) {
-  const locator = page.getByText(text, { exact: false }).first();
-  await locator.waitFor({ state: "visible", timeout });
-  await locator.click();
-}
 
-async function waitForCreditBalance(page: Page, timeout = 15000) {
-  const candidates = [
-    page.getByText("Credit Balance", { exact: false }).first(),
-    page.locator("text=Credit Balance").first(),
-    page.locator("span:has-text('Credit Balance')").first(),
-    page.locator("div:has-text('Credit Balance')").first(),
-  ];
+async def goto_audio_page(page):
+    # 念のため直URLも試す
+    await page.goto(AUDIO_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
 
-  for (const locator of candidates) {
-    try {
-      await locator.waitFor({ state: "visible", timeout: 3000 });
-      return locator;
-    } catch {
-      // continue
-    }
-  }
+    body_text = await page.locator("body").inner_text()
 
-  // 最後に少し長めに待つ
-  try {
-    const fallback = page.locator("text=Credit Balance").first();
-    await fallback.waitFor({ state: "visible", timeout });
-    return fallback;
-  } catch {
-    return null;
-  }
-}
+    # すでにAudio画面ならそのまま続行
+    if "Credit Balance" in body_text:
+        return "direct-url"
 
-function normalizeSpace(text: string): string {
-  return text.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-}
+    # basic-information 等に戻されているなら、左メニューから確実に辿る
+    # 親の Subscribe を押す
+    await click_menu_row_by_label(page, "Subscribe")
 
-function parseBalanceFromText(text: string): { balanceText: string; balanceValue: number | null } | null {
-  const normalized = normalizeSpace(text);
+    # 子の Audio を押す
+    await click_menu_row_by_label(page, "Audio")
 
-  // 例:
-  // "Credit Balance 1,234"
-  // "Credit Balance: 1,234"
-  // "Credit Balance USD 12.34"
-  // "Credit Balance 1234 credits"
-  const patterns = [
-    /Credit Balance[:\s]*([A-Za-z]{0,5}\s*[\d,]+(?:\.\d+)?)/i,
-    /Credit Balance.*?([A-Za-z]{0,5}\s*[\d,]+(?:\.\d+)?)/i,
-    /Balance[:\s]*([A-Za-z]{0,5}\s*[\d,]+(?:\.\d+)?)/i,
-  ];
+    # URL変化待ちは補助程度
+    try:
+        await page.wait_for_url("**/user-center/payment/audio-subscription**", timeout=8000)
+    except PlaywrightTimeoutError:
+        pass
 
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-    if (match?.[1]) {
-      const balanceText = match[1].trim();
-      const numeric = balanceText.replace(/[^\d.]/g, "");
-      const balanceValue = numeric ? Number(numeric) : null;
-      return {
-        balanceText,
-        balanceValue: Number.isFinite(balanceValue) ? balanceValue : null,
-      };
-    }
-  }
+    # 画面本文で到達判定
+    for _ in range(10):
+        body_text = await page.locator("body").inner_text()
+        if "Credit Balance" in body_text:
+            return "menu-click"
+        await page.wait_for_timeout(1000)
 
-  return null;
-}
+    raise Exception("audio page not reached")
 
-async function extractBalanceNearHeader(page: Page) {
-  const creditHeader = await waitForCreditBalance(page, 8000);
-  if (!creditHeader) return null;
 
-  // まず親要素周辺から取る
-  const parentTexts: string[] = [];
+async def fetch_minimax_balance(email: str, password: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-  try {
-    const parent = creditHeader.locator("xpath=..");
-    parentTexts.push(await parent.innerText());
-  } catch {}
+        try:
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle")
 
-  try {
-    const grandParent = creditHeader.locator("xpath=../..");
-    parentTexts.push(await grandParent.innerText());
-  } catch {}
+            # すでにログイン済みならスキップ
+            current_url = page.url
+            if "/user-center/" not in current_url:
+                await page.locator('input[type="email"]').fill(email)
+                await page.locator('input[type="password"]').fill(password)
 
-  try {
-    const section = creditHeader.locator("xpath=ancestor::div[1]");
-    parentTexts.push(await section.innerText());
-  } catch {}
+                sign_in_btn = page.locator("button:has-text('Sign in')").first
+                await sign_in_btn.click()
 
-  for (const text of parentTexts) {
-    const parsed = parseBalanceFromText(text);
-    if (parsed) return parsed;
-  }
+                await page.wait_for_url("**/user-center/**", timeout=20000)
+                await page.wait_for_timeout(3000)
 
-  return null;
-}
+            after_login_url = page.url
 
-async function gotoAudioSubscriptionDirect(page: Page) {
-  await page.goto(AUDIO_SUBSCRIPTION_URL, { waitUntil: "domcontentloaded" });
+            used_method = await goto_audio_page(page)
 
-  try {
-    await page.waitForURL("**/user-center/payment/audio-subscription**", {
-      timeout: 15000,
-    });
-  } catch {
-    // SPAやリダイレクトでURL待ちがこけても続行
-  }
+            # 到達後の全文取得
+            body_text = await page.locator("body").inner_text()
+            preview = body_text[:2000]
 
-  await page.waitForLoadState("networkidle").catch(() => {});
-}
+            # まず全文から素直に拾う
+            parsed = parse_balance(body_text)
+            if parsed:
+                return {
+                    "ok": True,
+                    "balanceText": parsed["balanceText"],
+                    "balanceValue": parsed["balanceValue"],
+                    "after_login_url": after_login_url,
+                    "url": page.url,
+                    "used_method": used_method,
+                    "preview": preview,
+                }
 
-async function gotoAudioSubscriptionByMenu(page: Page) {
-  // ページによってメニュー表示が少し違っても通しやすいように順番に試す
-  const clickPatterns = [
-    async () => {
-      await safeClickByText(page, "Subscribe", 5000);
-      await page.waitForTimeout(1000);
-      await safeClickByText(page, "Audio", 5000);
-    },
-    async () => {
-      await safeClickByText(page, "Billing", 5000);
-      await page.waitForTimeout(1000);
-      await safeClickByText(page, "Subscribe", 5000);
-      await page.waitForTimeout(1000);
-      await safeClickByText(page, "Audio", 5000);
-    },
-    async () => {
-      const audio = page.getByText("Audio", { exact: false }).first();
-      await audio.waitFor({ state: "visible", timeout: 5000 });
-      await audio.click();
-    },
-  ];
+            # Credit Balance の近くだけ再確認
+            card = page.locator("div:has-text('Credit Balance')").first
+            if await card.count() > 0:
+                card_text = await card.inner_text()
+                parsed = parse_balance(card_text)
+                if parsed:
+                    return {
+                        "ok": True,
+                        "balanceText": parsed["balanceText"],
+                        "balanceValue": parsed["balanceValue"],
+                        "after_login_url": after_login_url,
+                        "url": page.url,
+                        "used_method": used_method,
+                        "preview": card_text[:1000],
+                    }
 
-  let lastError: unknown = null;
+            return {
+                "ok": False,
+                "reason": "balance text not matched on audio page",
+                "after_login_url": after_login_url,
+                "url": page.url,
+                "used_method": used_method,
+                "preview": preview,
+            }
 
-  for (const action of clickPatterns) {
-    try {
-      await action();
-      await page.waitForTimeout(1500);
-      await page.waitForURL("**/user-center/payment/audio-subscription**", {
-        timeout: 10000,
-      }).catch(() => {});
-      await page.waitForLoadState("networkidle").catch(() => {});
-      return;
-    } catch (err) {
-      lastError = err;
-    }
-  }
+        except Exception as e:
+            preview = ""
+            try:
+                preview = (await page.locator("body").inner_text())[:2000]
+            except:
+                pass
 
-  throw lastError ?? new Error("menu navigation failed");
-}
+            return {
+                "ok": False,
+                "reason": str(e),
+                "after_login_url": page.url,
+                "url": page.url,
+                "used_method": "unknown",
+                "preview": preview,
+            }
 
-async function ensureLoggedIn(page: Page, email: string, password: string) {
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForLoadState("networkidle").catch(() => {});
-
-  const currentUrl = page.url();
-  if (
-    currentUrl.includes("/user-center/") ||
-    (await page.locator("text=Basic Information").count().catch(() => 0)) > 0
-  ) {
-    return;
-  }
-
-  // すでにログイン済みでなければログイン処理
-  const emailInput = page.locator('input[type="email"], input[placeholder*="Email"]').first();
-  const passwordInput = page.locator('input[type="password"]').first();
-
-  await emailInput.waitFor({ state: "visible", timeout: 15000 });
-  await emailInput.fill(email);
-
-  await passwordInput.waitFor({ state: "visible", timeout: 15000 });
-  await passwordInput.fill(password);
-
-  // ボタンの表記ゆれ対策
-  const signInButton = page
-    .locator("button")
-    .filter({ hasText: /sign in|login|log in/i })
-    .first();
-
-  await Promise.all([
-    page.waitForLoadState("domcontentloaded").catch(() => {}),
-    signInButton.click(),
-  ]);
-
-  // ログイン後は basic-information か user-center 配下にいるはず
-  await page.waitForURL("**/user-center/**", { timeout: 20000 });
-  await page.waitForLoadState("networkidle").catch(() => {});
-}
-
-export async function fetchMinimaxAudioCredit(params: {
-  email: string;
-  password: string;
-  headless?: boolean;
-}): Promise<MinimaxCreditResult> {
-  const browser = await chromium.launch({
-    headless: params.headless ?? true,
-  });
-
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  try {
-    await ensureLoggedIn(page, params.email, params.password);
-
-    const afterLoginUrl = page.url();
-    await logPageSnapshot(page, "AFTER LOGIN");
-
-    // 1. まずURL直移動
-    let usedMethod = "direct-url";
-    await gotoAudioSubscriptionDirect(page);
-    await logPageSnapshot(page, "AFTER DIRECT GOTO");
-
-    let creditHeader = await waitForCreditBalance(page, 8000);
-
-    // 2. 見つからなければメニュー遷移
-    if (!creditHeader) {
-      usedMethod = "menu-navigation";
-      await gotoAudioSubscriptionByMenu(page);
-      await logPageSnapshot(page, "AFTER MENU NAVIGATION");
-      creditHeader = await waitForCreditBalance(page, 12000);
-    }
-
-    if (!creditHeader) {
-      const debugPath = await saveDebugFiles(page, "minimax_credit_not_found");
-      const preview = (await page.locator("body").innerText().catch(() => "")).slice(0, 1500);
-
-      return {
-        ok: false,
-        reason: "balance not found",
-        afterLoginUrl,
-        url: page.url(),
-        usedMethod,
-        preview,
-        debugPath,
-      };
-    }
-
-    // 3. ヘッダー近辺から取る
-    const nearHeader = await extractBalanceNearHeader(page);
-    if (nearHeader) {
-      return {
-        ok: true,
-        balanceText: nearHeader.balanceText,
-        balanceValue: nearHeader.balanceValue,
-        url: page.url(),
-        usedMethod,
-      };
-    }
-
-    // 4. 全文から取る
-    const bodyText = await page.locator("body").innerText();
-    const parsed = parseBalanceFromText(bodyText);
-
-    if (parsed) {
-      return {
-        ok: true,
-        balanceText: parsed.balanceText,
-        balanceValue: parsed.balanceValue,
-        url: page.url(),
-        usedMethod: `${usedMethod}-body-parse`,
-      };
-    }
-
-    // 5. それでもだめならデバッグ保存
-    const debugPath = await saveDebugFiles(page, "minimax_balance_parse_failed");
-    return {
-      ok: false,
-      reason: "balance text not matched",
-      afterLoginUrl,
-      url: page.url(),
-      usedMethod,
-      preview: bodyText.slice(0, 1500),
-      debugPath,
-    };
-  } catch (error) {
-    const debugPath = await saveDebugFiles(page, "minimax_exception").catch(() => undefined);
-    const preview = await page.locator("body").innerText().catch(() => "");
-
-    return {
-      ok: false,
-      reason: error instanceof Error ? error.message : "unknown error",
-      afterLoginUrl: page.url(),
-      url: page.url(),
-      preview: preview.slice(0, 1500),
-      debugPath,
-    };
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-}
+        finally:
+            await context.close()
+            await browser.close()
