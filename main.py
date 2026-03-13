@@ -10,7 +10,11 @@ EMAIL = os.getenv("MINIMAX_EMAIL")
 PASSWORD = os.getenv("MINIMAX_PASSWORD")
 
 LOGIN_URL = "https://platform.minimax.io/login"
-SUBSCRIBE_URL = "https://platform.minimax.io/user-center/payment/subscribe"
+
+# まず本命
+AUDIO_URL_PRIMARY = "https://platform.minimax.io/subscribe/audio-subscription"
+# 保険
+AUDIO_URL_FALLBACK = "https://platform.minimax.io/user-center/payment/audio-subscription"
 
 
 @app.get("/")
@@ -24,8 +28,8 @@ def extract_balance(text: str):
         r"Remaining Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Available Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Credits Remaining[^0-9]*([0-9][0-9,\.]*)",
-        r"Remaining[^0-9]{0,20}([0-9][0-9,\.]*)\s*credits",
-        r"Available[^0-9]{0,20}([0-9][0-9,\.]*)\s*credits",
+        r"Remaining[^0-9]{0,30}([0-9][0-9,\.]*)\s*credits",
+        r"Available[^0-9]{0,30}([0-9][0-9,\.]*)\s*credits",
     ]
 
     for pattern in patterns:
@@ -36,7 +40,7 @@ def extract_balance(text: str):
     return None
 
 
-def safe_wait(page, ms=2500):
+def safe_wait(page, ms=3000):
     try:
         page.wait_for_load_state("domcontentloaded", timeout=10000)
     except Exception:
@@ -50,126 +54,121 @@ def safe_wait(page, ms=2500):
     page.wait_for_timeout(ms)
 
 
-def click_audio_subscription(page):
-    candidates = [
-        page.get_by_role("link", name="Audio Subscription"),
-        page.get_by_role("button", name="Audio Subscription"),
-        page.get_by_text("Audio Subscription", exact=True),
-        page.locator("text=Audio Subscription"),
-        page.locator("a:has-text('Audio Subscription')"),
-        page.locator("button:has-text('Audio Subscription')"),
-        page.locator("div:has-text('Audio Subscription')"),
-        page.locator("span:has-text('Audio Subscription')"),
-    ]
-
-    for locator in candidates:
-        try:
-            target = locator.first
-            if target.is_visible():
-                target.click(force=True)
-                page.wait_for_timeout(4000)
-                return True
-        except Exception:
-            continue
-
-    return False
+def is_404_page(text: str):
+    return (
+        "404" in text
+        and ("页面不存在" in text or "page not found" in text.lower() or "访问的页面不存在" in text)
+    )
 
 
-def get_balance_page():
-    if not EMAIL or not PASSWORD:
-        raise Exception("MINIMAX_EMAIL or MINIMAX_PASSWORD is empty")
+def get_page_text(page):
+    try:
+        page.wait_for_selector("body", timeout=10000)
+    except Exception:
+        pass
+    safe_wait(page, 2500)
+    return page.locator("body").inner_text()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-software-rasterizer",
-            ],
-        )
 
-        context = browser.new_context(viewport={"width": 1280, "height": 800})
-        page = context.new_page()
+def goto_audio_page(page):
+    # 1回目: 本命URL
+    page.goto(AUDIO_URL_PRIMARY, wait_until="domcontentloaded", timeout=45000)
+    text = get_page_text(page)
+    url = page.url
 
-        try:
-            # 1. ログイン
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_selector("#mail", timeout=45000)
-            page.wait_for_selector("#password", timeout=45000)
+    if not is_404_page(text):
+        return {
+            "url": url,
+            "text": text,
+            "used_url": AUDIO_URL_PRIMARY,
+        }
 
-            page.fill("#mail", EMAIL)
-            page.fill("#password", PASSWORD)
-            page.get_by_role("button", name="Sign in").click()
+    # 2回目: fallback
+    page.goto(AUDIO_URL_FALLBACK, wait_until="domcontentloaded", timeout=45000)
+    text = get_page_text(page)
+    url = page.url
 
-            page.wait_for_url("**/user-center/**", timeout=45000)
-            safe_wait(page, 4000)
-
-            # 2. Subscribeページへ
-            page.goto(SUBSCRIBE_URL, wait_until="domcontentloaded", timeout=45000)
-            safe_wait(page, 5000)
-
-            # 3. Audio Subscription をクリック
-            clicked_audio = click_audio_subscription(page)
-            safe_wait(page, 5000)
-
-            current_url = page.url
-            body_text = page.locator("body").inner_text()
-
-            return {
-                "url": current_url,
-                "text": body_text,
-                "clicked_audio": clicked_audio,
-            }
-
-        finally:
-            browser.close()
+    return {
+        "url": url,
+        "text": text,
+        "used_url": AUDIO_URL_FALLBACK,
+    }
 
 
 @app.get("/balance")
 def balance():
     try:
-        result = get_balance_page()
-        current_url = result["url"]
-        body_text = result["text"]
-        clicked_audio = result["clicked_audio"]
-
-        # Audio系ページに入れているか
-        on_audio_page = (
-            "audio" in current_url.lower()
-            or "Audio Subscription" in body_text
-        )
-
-        if not on_audio_page:
+        if not EMAIL or not PASSWORD:
             return {
                 "ok": False,
-                "reason": "not on audio subscription page",
-                "url": current_url,
-                "clicked_audio": clicked_audio,
-                "preview": body_text[:3000],
+                "error": "MINIMAX_EMAIL or MINIMAX_PASSWORD is empty"
             }
 
-        found = extract_balance(body_text)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-software-rasterizer",
+                ],
+            )
 
-        if found:
-            return {
-                "ok": True,
-                "balance": found,
-                "url": current_url,
-                "clicked_audio": clicked_audio,
-            }
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
 
-        return {
-            "ok": False,
-            "reason": "balance text not matched",
-            "url": current_url,
-            "clicked_audio": clicked_audio,
-            "preview": body_text[:3000],
-        }
+            try:
+                # 1. ログイン
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_selector("#mail", timeout=45000)
+                page.wait_for_selector("#password", timeout=45000)
+
+                page.fill("#mail", EMAIL)
+                page.fill("#password", PASSWORD)
+                page.get_by_role("button", name="Sign in").click()
+
+                page.wait_for_url("**/user-center/**", timeout=45000)
+                safe_wait(page, 4000)
+
+                # 2. Audio Subscription ページへ
+                result = goto_audio_page(page)
+                current_url = result["url"]
+                body_text = result["text"]
+                used_url = result["used_url"]
+
+                if is_404_page(body_text):
+                    return {
+                        "ok": False,
+                        "reason": "audio subscription page returned 404",
+                        "url": current_url,
+                        "used_url": used_url,
+                        "preview": body_text[:3000],
+                    }
+
+                found = extract_balance(body_text)
+
+                if found:
+                    return {
+                        "ok": True,
+                        "balance": found,
+                        "url": current_url,
+                        "used_url": used_url,
+                    }
+
+                return {
+                    "ok": False,
+                    "reason": "balance text not matched",
+                    "url": current_url,
+                    "used_url": used_url,
+                    "preview": body_text[:3000],
+                }
+
+            finally:
+                browser.close()
 
     except Exception as e:
         return {
