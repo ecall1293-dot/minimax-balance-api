@@ -10,7 +10,6 @@ EMAIL = os.getenv("MINIMAX_EMAIL")
 PASSWORD = os.getenv("MINIMAX_PASSWORD")
 
 LOGIN_URL = "https://platform.minimax.io/login"
-BALANCE_URL = "https://platform.minimax.io/user-center/payment/audio-subscription"
 
 
 @app.get("/")
@@ -24,12 +23,24 @@ def extract_balance(text: str):
         r"Remaining Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Available Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Credits Remaining[^0-9]*([0-9][0-9,\.]*)",
+        r"Audio[^0-9]{0,40}([0-9][0-9,\.]*)\s*credits",
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             return f"{m.group(1).strip()} credits"
     return None
+
+
+def click_if_exists(page, role: str, name: str, timeout: int = 5000):
+    try:
+        locator = page.get_by_role(role, name=name)
+        locator.first.wait_for(timeout=timeout)
+        locator.first.click()
+        page.wait_for_timeout(2000)
+        return True
+    except Exception:
+        return False
 
 
 @app.get("/balance")
@@ -59,7 +70,7 @@ def balance():
             page = context.new_page()
 
             try:
-                # login
+                # 1. login
                 page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_selector("#mail", timeout=45000)
                 page.wait_for_selector("#password", timeout=45000)
@@ -68,27 +79,45 @@ def balance():
                 page.fill("#password", PASSWORD)
                 page.get_by_role("button", name="Sign in").click()
 
-                # login complete
                 page.wait_for_url("**/user-center/**", timeout=45000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
 
-                # target page
-                page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=45000)
+                # 2. 直URLではなく、画面内メニューから遷移を試す
+                clicked = False
+
+                # まず Subscribe を試す
+                if click_if_exists(page, "link", "Subscribe") or click_if_exists(page, "button", "Subscribe"):
+                    clicked = True
+
+                # 次に Audio を試す
+                if click_if_exists(page, "link", "Audio") or click_if_exists(page, "button", "Audio"):
+                    clicked = True
+
+                # クリックで変化しない場合、テキストクリックも試す
+                if not clicked:
+                    try:
+                        page.locator("text=Audio").first.click()
+                        page.wait_for_timeout(3000)
+                        clicked = True
+                    except Exception:
+                        pass
+
+                if not clicked:
+                    try:
+                        page.locator("text=Subscribe").first.click()
+                        page.wait_for_timeout(3000)
+                        clicked = True
+                    except Exception:
+                        pass
+
+                # 念のため少し待つ
                 page.wait_for_timeout(5000)
 
                 current_url = page.url
                 body_text = page.locator("body").inner_text()
 
-                # wrong page guard
-                if "audio-subscription" not in current_url:
-                    return {
-                        "ok": False,
-                        "reason": "not on audio subscription page",
-                        "url": current_url,
-                        "preview": body_text[:3000],
-                    }
-
                 found = extract_balance(body_text)
+
                 if found:
                     return {
                         "ok": True,
