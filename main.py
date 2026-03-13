@@ -18,7 +18,7 @@ def root():
     return {"ok": True, "message": "service is running"}
 
 
-def extract_balance(text: str) -> str | None:
+def extract_balance(text: str):
     patterns = [
         r"([0-9][0-9,\.]*)\s*credits",
         r"Remaining[^0-9]*([0-9][0-9,\.]*)",
@@ -26,52 +26,66 @@ def extract_balance(text: str) -> str | None:
         r"Balance[^0-9]*([0-9][0-9,\.]*)",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = match.group(1).strip()
-            if "credit" in pattern.lower():
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            value = m.group(1).strip()
+            if "credit" in p.lower():
                 return f"{value} credits"
             return value
 
     return None
 
 
-def get_balance_page_text() -> dict:
+def get_balance_page():
+
     if not EMAIL or not PASSWORD:
         raise Exception("MINIMAX_EMAIL or MINIMAX_PASSWORD is empty")
 
     with sync_playwright() as p:
+
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-software-rasterizer",
+            ]
         )
-        page = browser.new_page()
+
+        context = browser.new_context(
+            viewport={"width": 1200, "height": 800}
+        )
+
+        page = context.new_page()
 
         try:
-            # 1. ログインページへ
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
 
-            # 2. 入力欄待機
+            # ログインページ
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+
             page.wait_for_selector("#mail", timeout=60000)
             page.wait_for_selector("#password", timeout=60000)
 
-            # 3. 入力
             page.fill("#mail", EMAIL)
             page.fill("#password", PASSWORD)
 
-            # 4. ログイン
             page.get_by_role("button", name="Sign in").click()
-            page.wait_for_timeout(7000)
 
-            # 5. 音声サブスクページへ
+            page.wait_for_timeout(8000)
+
+            # 残高ページ
             page.goto(BALANCE_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(7000)
 
-            # 6. ページ情報取得
+            page.wait_for_timeout(8000)
+
             title = page.title()
             url = page.url
+
             body_text = page.locator("body").inner_text()
 
             return {
@@ -86,18 +100,21 @@ def get_balance_page_text() -> dict:
 
 @app.get("/balance")
 def balance():
+
     try:
-        result = get_balance_page_text()
+
+        result = get_balance_page()
+
         text = result["text"]
         title = result["title"]
         url = result["url"]
 
-        extracted = extract_balance(text)
+        balance = extract_balance(text)
 
-        if extracted:
+        if balance:
             return {
                 "ok": True,
-                "balance": extracted,
+                "balance": balance,
                 "title": title,
                 "url": url
             }
@@ -111,6 +128,7 @@ def balance():
         }
 
     except Exception as e:
+
         return {
             "ok": False,
             "error": str(e),
