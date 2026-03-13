@@ -13,48 +13,27 @@ PASSWORD = os.getenv("MINIMAX_PASSWORD")
 def root():
     return {"ok": True, "message": "service is running"}
 
-def get_balance():
-    if not EMAIL or not PASSWORD:
-        raise Exception("MINIMAX_EMAIL or MINIMAX_PASSWORD is empty")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        try:
-            page.goto("https://platform.minimax.io/login", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
-
-            page.fill('input[type="email"]', EMAIL)
-            page.fill('input[type="password"]', PASSWORD)
-            page.click('button[type="submit"]')
-            page.wait_for_timeout(5000)
-
-            page.goto("https://platform.minimax.io/billing", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(5000)
-
-            text = page.inner_text("body")
-            print("===== PAGE TEXT START =====")
-            print(text[:5000])
-            print("===== PAGE TEXT END =====")
-
-            return text
-
-        finally:
-            browser.close()
-
 @app.get("/balance")
 def balance():
     try:
-        text = get_balance()
-        match = re.search(r"([0-9,]+)\s*credits", text, re.IGNORECASE)
-        if match:
-            return {"balance": f"{match.group(1)} credits"}
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-        return {
-            "balance": "not found",
-            "preview": text[:1000]
-        }
+            page.goto("https://platform.minimax.io/login", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(5000)
+
+            title = page.title()
+            url = page.url
+            body = page.locator("body").inner_text()
+
+            browser.close()
+
+            return {
+                "title": title,
+                "url": url,
+                "preview": body[:3000]
+            }
 
     except Exception as e:
         return {
