@@ -24,12 +24,15 @@ def extract_balance(text: str):
         r"Remaining Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Available Credits[^0-9]*([0-9][0-9,\.]*)",
         r"Credits Remaining[^0-9]*([0-9][0-9,\.]*)",
-        r"Audio[^0-9]{0,40}([0-9][0-9,\.]*)\s*credits",
+        r"Remaining[^0-9]{0,20}([0-9][0-9,\.]*)\s*credits",
+        r"Available[^0-9]{0,20}([0-9][0-9,\.]*)\s*credits",
     ]
+
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             return f"{m.group(1).strip()} credits"
+
     return None
 
 
@@ -38,30 +41,33 @@ def safe_wait(page, ms=2500):
         page.wait_for_load_state("domcontentloaded", timeout=10000)
     except Exception:
         pass
+
     try:
         page.wait_for_load_state("load", timeout=10000)
     except Exception:
         pass
+
     page.wait_for_timeout(ms)
 
 
-def try_click_audio_tab(page):
+def click_audio_subscription(page):
     candidates = [
-        "text=Audio",
-        ":text('Audio')",
-        "div:has-text('Audio')",
-        "span:has-text('Audio')",
-        "button:has-text('Audio')",
-        "[role='tab']:has-text('Audio')",
-        ".ant-tabs-tab:has-text('Audio')",
+        page.get_by_role("link", name="Audio Subscription"),
+        page.get_by_role("button", name="Audio Subscription"),
+        page.get_by_text("Audio Subscription", exact=True),
+        page.locator("text=Audio Subscription"),
+        page.locator("a:has-text('Audio Subscription')"),
+        page.locator("button:has-text('Audio Subscription')"),
+        page.locator("div:has-text('Audio Subscription')"),
+        page.locator("span:has-text('Audio Subscription')"),
     ]
 
-    for sel in candidates:
+    for locator in candidates:
         try:
-            loc = page.locator(sel).first
-            if loc.is_visible():
-                loc.click(force=True)
-                page.wait_for_timeout(2500)
+            target = locator.first
+            if target.is_visible():
+                target.click(force=True)
+                page.wait_for_timeout(4000)
                 return True
         except Exception:
             continue
@@ -103,13 +109,13 @@ def get_balance_page():
             page.wait_for_url("**/user-center/**", timeout=45000)
             safe_wait(page, 4000)
 
-            # 2. まず Subscribe ページへ行く
+            # 2. Subscribeページへ
             page.goto(SUBSCRIBE_URL, wait_until="domcontentloaded", timeout=45000)
             safe_wait(page, 5000)
 
-            # 3. Audio タブを押す
-            clicked_audio = try_click_audio_tab(page)
-            safe_wait(page, 3000)
+            # 3. Audio Subscription をクリック
+            clicked_audio = click_audio_subscription(page)
+            safe_wait(page, 5000)
 
             current_url = page.url
             body_text = page.locator("body").inner_text()
@@ -131,6 +137,21 @@ def balance():
         current_url = result["url"]
         body_text = result["text"]
         clicked_audio = result["clicked_audio"]
+
+        # Audio系ページに入れているか
+        on_audio_page = (
+            "audio" in current_url.lower()
+            or "Audio Subscription" in body_text
+        )
+
+        if not on_audio_page:
+            return {
+                "ok": False,
+                "reason": "not on audio subscription page",
+                "url": current_url,
+                "clicked_audio": clicked_audio,
+                "preview": body_text[:3000],
+            }
 
         found = extract_balance(body_text)
 
