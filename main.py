@@ -7,7 +7,8 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-print("MINIMAX VERSION: 2026-03-14-05")
+VERSION = "2026-03-14-06"
+print(f"MINIMAX VERSION: {VERSION}")
 
 LOGIN_URL = "https://platform.minimax.io/login"
 BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
@@ -18,32 +19,16 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def parse_balance_from_text(text: str) -> Optional[Dict[str, Any]]:
-    normalized = clean_text(text)
-
-    patterns = [
-        r"Credit Balance\s*([0-9][0-9,]*(?:\.\d+)?)",
-        r"Credit Balance.*?([0-9][0-9,]*(?:\.\d+)?)",
-        r"Balance\s*([0-9][0-9,]*(?:\.\d+)?)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, normalized, re.IGNORECASE)
-        if m:
-            raw = m.group(1).strip()
-            num = raw.replace(",", "")
-            value = None
-            try:
-                value = float(num)
-            except ValueError:
-                value = None
-
-            return {
-                "balanceText": raw,
-                "balanceValue": value,
-            }
-
-    return None
+def parse_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+    num = re.sub(r"[^\d.]", "", text)
+    if not num:
+        return None
+    try:
+        return float(num)
+    except ValueError:
+        return None
 
 
 async def get_body_text(page) -> str:
@@ -64,10 +49,9 @@ async def login(page, email: str, password: str) -> str:
 
     print("login url =", page.url)
 
-    # メール欄
     email_candidates = [
-        page.locator('input[placeholder="Email"]').first,
         page.get_by_placeholder("Email").first,
+        page.locator('input[placeholder="Email"]').first,
         page.locator('input[type="text"]').first,
         page.locator('input[type="email"]').first,
     ]
@@ -86,7 +70,6 @@ async def login(page, email: str, password: str) -> str:
         preview = await get_body_preview(page)
         raise Exception(f"email input not found; preview={preview}")
 
-    # パスワード欄
     password_candidates = [
         page.locator('input[type="password"]').first,
         page.locator('input[autocomplete="current-password"]').first,
@@ -109,7 +92,6 @@ async def login(page, email: str, password: str) -> str:
     await email_input.fill(email)
     await password_input.fill(password)
 
-    # Sign in ボタン
     sign_in_candidates = [
         page.get_by_role("button", name="Sign in").first,
         page.locator("button:has-text('Sign in')").first,
@@ -131,7 +113,6 @@ async def login(page, email: str, password: str) -> str:
 
     await sign_in_button.click()
 
-    # basic-information 到達待ち
     await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
     await page.wait_for_timeout(2500)
 
@@ -145,47 +126,86 @@ async def open_audio_subscription(page) -> str:
 
     print("after goto audio url =", page.url)
 
-    # 画面の固有要素を待つ
-    await page.locator("h1").filter(has_text="Audio Subscription").first.wait_for(
+    await page.locator("text=Audio Subscription").first.wait_for(
         state="visible",
         timeout=15000,
     )
-
     await page.locator("text=Credit Balance").first.wait_for(
         state="visible",
         timeout=15000,
     )
 
-    body_preview = await get_body_preview(page, 1200)
-    print("audio page preview =", body_preview)
+    preview = await get_body_preview(page, 1200)
+    print("audio page preview =", preview)
 
     return page.url
 
 
 async def extract_balance(page) -> Optional[Dict[str, Any]]:
-    # カード単位で優先取得
+    # まずユーザーが貼ってくれた構造に寄せて取得
+    # <div class="flex justify-between items-baseline mt-[16px]"> ... </div>
+    #   左側: Credit Balance
+    #   右側: <span>99,728</span>
+    #
+    # Tailwind の class は [] を含むので使わず、テキスト起点で祖先から拾う。
+
     card_candidates = [
-        page.locator("div:has-text('Credit Balance')").first,
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[3]"),
+        page.locator("div:has-text('Credit Balance')").first,
     ]
 
     for idx, card in enumerate(card_candidates, start=1):
         try:
-            if await card.count() > 0:
-                text = await card.inner_text()
-                print(f"credit card candidate #{idx} =", text)
-                parsed = parse_balance_from_text(text)
-                if parsed:
-                    return parsed
+            if await card.count() == 0:
+                continue
+
+            card_text = await card.inner_text()
+            print(f"card candidate #{idx} text =", card_text)
+
+            # まず card 全体から直接パース
+            m = re.search(r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)", clean_text(card_text), re.I)
+            if m:
+                raw = m.group(1).strip()
+                return {
+                    "balanceText": raw,
+                    "balanceValue": parse_number(raw),
+                }
+
+            # 右端 span を拾ってみる
+            spans = card.locator("span")
+            count = await spans.count()
+            for i in range(count):
+                txt = clean_text(await spans.nth(i).inner_text())
+                if re.fullmatch(r"[0-9][0-9,]*(?:\.\d+)?", txt):
+                    return {
+                        "balanceText": txt,
+                        "balanceValue": parse_number(txt),
+                    }
         except Exception:
             pass
 
-    # 最後に全文
+    # 最後に全文からフォールバック
     body_text = await get_body_text(page)
+    normalized = clean_text(body_text)
     print("fallback body parse")
-    return parse_balance_from_text(body_text)
+
+    patterns = [
+        r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        r"Credit Balance.*?([0-9][0-9,]*(?:\.\d+)?)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, normalized, re.I)
+        if m:
+            raw = m.group(1).strip()
+            return {
+                "balanceText": raw,
+                "balanceValue": parse_number(raw),
+            }
+
+    return None
 
 
 async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
@@ -201,9 +221,10 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
         page = await context.new_page()
 
         after_login_url = ""
+
         try:
             after_login_url = await login(page, email, password)
-            audio_url = await open_audio_subscription(page)
+            current_url = await open_audio_subscription(page)
 
             parsed = await extract_balance(page)
             preview = await get_body_preview(page, 2000)
@@ -214,7 +235,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                     "balanceText": parsed["balanceText"],
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
-                    "url": audio_url,
+                    "url": current_url,
                     "used_method": "login-basicinfo-audio-url",
                     "preview": preview,
                 }
@@ -253,7 +274,7 @@ async def root():
     return {
         "ok": True,
         "message": "MiniMax balance API is running",
-        "version": "2026-03-14-05",
+        "version": VERSION,
     }
 
 
