@@ -1,8 +1,10 @@
-import asyncio
 import json
 import os
 import re
 from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 LOGIN_URL = "https://platform.minimax.io/login"
@@ -11,11 +13,11 @@ BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
 EMAIL = os.environ.get("MINIMAX_EMAIL", "")
 PASSWORD = os.environ.get("MINIMAX_PASSWORD", "")
 
-if not EMAIL or not PASSWORD:
-    raise RuntimeError("MINIMAX_EMAIL / MINIMAX_PASSWORD が設定されていません")
-
-HEADLESS = False
+# Render では基本 True 推奨
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 STATE_FILE = "minimax_state.json"
+
+app = FastAPI(title="minimax-balance-api")
 
 
 def parse_number(text: str):
@@ -242,8 +244,15 @@ async def open_audio_and_capture_balance(page, logs: list[str]):
     raise Exception(f"balance not captured after audio click; current url={page.url}")
 
 
-async def main():
-    logs = []
+async def fetch_balance() -> dict[str, Any]:
+    logs: list[str] = []
+
+    if not EMAIL or not PASSWORD:
+        return {
+            "ok": False,
+            "reason": "MINIMAX_EMAIL / MINIMAX_PASSWORD が設定されていません",
+            "logs": logs,
+        }
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -264,14 +273,17 @@ async def main():
 
             try:
                 cookies = await context.cookies()
-                state_path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+                state_path.write_text(
+                    json.dumps(cookies, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 logs.append("cookies saved")
             except Exception as e:
                 logs.append(f"cookie save failed: {e}")
 
             result = await open_audio_and_capture_balance(page, logs)
 
-            output = {
+            return {
                 "ok": True,
                 "balanceText": result["balanceText"],
                 "balanceValue": result["balanceValue"],
@@ -280,22 +292,34 @@ async def main():
                 "preview": result["preview"],
                 "logs": logs,
             }
-            print(json.dumps(output, ensure_ascii=False, indent=2))
 
         except Exception as e:
-            output = {
+            return {
                 "ok": False,
                 "reason": str(e),
                 "url": page.url,
                 "preview": await get_body_preview(page, 2000),
                 "logs": logs,
             }
-            print(json.dumps(output, ensure_ascii=False, indent=2))
 
         finally:
             await context.close()
             await browser.close()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "message": "minimax-balance-api running",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/balance")
+async def balance():
+    return await fetch_balance()
