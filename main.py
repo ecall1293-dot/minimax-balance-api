@@ -1,13 +1,13 @@
 import os
 import re
-from typing import Optional, Any, Dict
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-print("MINIMAX VERSION: 2026-03-14-03")
+print("MINIMAX VERSION: 2026-03-14-05")
 
 LOGIN_URL = "https://platform.minimax.io/login"
 BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
@@ -18,27 +18,25 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def parse_balance(text: str) -> Optional[Dict[str, Any]]:
+def parse_balance_from_text(text: str) -> Optional[Dict[str, Any]]:
     normalized = clean_text(text)
 
     patterns = [
-        r"Credit Balance[:\s]*([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
-        r"Credit Balance.*?([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
-        r"Available Credit[:\s]*([A-Za-z$¥]?\s*[\d,]+(?:\.\d+)?)",
-        r"Balance[:\s]*([A-Za-z$¥]?\s*([0-9][\d,]*(?:\.\d+)?))",
+        r"Credit Balance\s*([0-9][0-9,]*(?:\.\d+)?)",
+        r"Credit Balance.*?([0-9][0-9,]*(?:\.\d+)?)",
+        r"Balance\s*([0-9][0-9,]*(?:\.\d+)?)",
     ]
 
     for pattern in patterns:
         m = re.search(pattern, normalized, re.IGNORECASE)
         if m:
             raw = m.group(1).strip()
-            num = re.sub(r"[^\d.]", "", raw)
+            num = raw.replace(",", "")
             value = None
-            if num:
-                try:
-                    value = float(num)
-                except ValueError:
-                    value = None
+            try:
+                value = float(num)
+            except ValueError:
+                value = None
 
             return {
                 "balanceText": raw,
@@ -60,29 +58,24 @@ async def get_body_preview(page, limit: int = 1500) -> str:
     return text[:limit]
 
 
-async def login_if_needed(page, email: str, password: str) -> str:
+async def login(page, email: str, password: str) -> str:
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(2000)
 
-    current_url = page.url
-    print("login page url =", current_url)
+    print("login url =", page.url)
 
-    if "/user-center/" in current_url:
-        print("already logged in")
-        return current_url
-
-    email_input = None
+    # メール欄
     email_candidates = [
-        page.get_by_placeholder("Email").first,
         page.locator('input[placeholder="Email"]').first,
-        page.locator('input[autocomplete="username"]').first,
+        page.get_by_placeholder("Email").first,
         page.locator('input[type="text"]').first,
         page.locator('input[type="email"]').first,
     ]
 
+    email_input = None
     for idx, candidate in enumerate(email_candidates, start=1):
         try:
-            await candidate.wait_for(state="visible", timeout=2500)
+            await candidate.wait_for(state="visible", timeout=3000)
             email_input = candidate
             print(f"email input matched candidate #{idx}")
             break
@@ -93,12 +86,13 @@ async def login_if_needed(page, email: str, password: str) -> str:
         preview = await get_body_preview(page)
         raise Exception(f"email input not found; preview={preview}")
 
-    password_input = None
+    # パスワード欄
     password_candidates = [
         page.locator('input[type="password"]').first,
         page.locator('input[autocomplete="current-password"]').first,
     ]
 
+    password_input = None
     for idx, candidate in enumerate(password_candidates, start=1):
         try:
             await candidate.wait_for(state="visible", timeout=3000)
@@ -115,13 +109,13 @@ async def login_if_needed(page, email: str, password: str) -> str:
     await email_input.fill(email)
     await password_input.fill(password)
 
-    sign_in_button = None
+    # Sign in ボタン
     sign_in_candidates = [
         page.get_by_role("button", name="Sign in").first,
         page.locator("button:has-text('Sign in')").first,
-        page.locator("button").filter(has_text=re.compile(r"sign in|login|log in", re.I)).first,
     ]
 
+    sign_in_button = None
     for idx, candidate in enumerate(sign_in_candidates, start=1):
         try:
             await candidate.wait_for(state="visible", timeout=3000)
@@ -137,103 +131,61 @@ async def login_if_needed(page, email: str, password: str) -> str:
 
     await sign_in_button.click()
 
-    await page.wait_for_url("**/user-center/**", timeout=20000)
-    await page.wait_for_timeout(3000)
+    # basic-information 到達待ち
+    await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
+    await page.wait_for_timeout(2500)
 
     print("after login url =", page.url)
     return page.url
 
 
-async def click_subscribe_audio(page) -> None:
-    # まず Basic Information を安定表示
-    await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
-
-    # Subscribe 親セクション
-    subscribe_section = page.locator("div.flex.flex-col.mb-[8px]").filter(
-        has=page.locator("p:text-is('Subscribe')")
-    ).first
-
-    await subscribe_section.wait_for(state="visible", timeout=10000)
-
-    # 親ヘッダー Subscribe 行
-    subscribe_header = subscribe_section.locator("div.cursor-pointer").filter(
-        has=page.locator("section p:text-is('Subscribe')")
-    ).first
-
-    await subscribe_header.wait_for(state="visible", timeout=10000)
-    await subscribe_header.click(force=True)
-    await page.wait_for_timeout(1200)
-
-    # 子行 Audio
-    audio_row = subscribe_section.locator("div.cursor-pointer").filter(
-        has=page.locator("p:text-is('Audio')")
-    ).first
-
-    await audio_row.wait_for(state="visible", timeout=10000)
-    await audio_row.click(force=True)
-    await page.wait_for_timeout(3000)
-
-    print("after audio click url =", page.url)
-    body_preview = await get_body_preview(page, 1000)
-    print("after audio click preview =", body_preview)
-
-
-async def ensure_audio_page(page) -> str:
-    # 1. 直URLを先に試す
+async def open_audio_subscription(page) -> str:
     await page.goto(AUDIO_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2500)
 
-    body_text = await get_body_text(page)
-    print("after direct goto url =", page.url)
+    print("after goto audio url =", page.url)
 
-    if "Credit Balance" in body_text:
-        return "direct-url"
+    # 画面の固有要素を待つ
+    await page.locator("h1").filter(has_text="Audio Subscription").first.wait_for(
+        state="visible",
+        timeout=15000,
+    )
 
-    # 2. メニュー操作で再遷移
-    await click_subscribe_audio(page)
+    await page.locator("text=Credit Balance").first.wait_for(
+        state="visible",
+        timeout=15000,
+    )
 
-    try:
-        await page.wait_for_url("**/user-center/payment/audio-subscription**", timeout=8000)
-    except PlaywrightTimeoutError:
-        pass
+    body_preview = await get_body_preview(page, 1200)
+    print("audio page preview =", body_preview)
 
-    for _ in range(10):
-        body_text = await get_body_text(page)
-        if "Credit Balance" in body_text:
-            print("audio page detected by body text")
-            return "menu-click"
-        await page.wait_for_timeout(1000)
-
-    raise Exception(f"audio page not reached; current url={page.url}")
+    return page.url
 
 
 async def extract_balance(page) -> Optional[Dict[str, Any]]:
-    # 全文から探す
-    body_text = await get_body_text(page)
-    parsed = parse_balance(body_text)
-    if parsed:
-        return parsed
-
-    # Credit Balance 周辺候補
-    candidates = [
+    # カード単位で優先取得
+    card_candidates = [
         page.locator("div:has-text('Credit Balance')").first,
-        page.locator("span:has-text('Credit Balance')").first.locator("xpath=.."),
-        page.locator("text=Credit Balance").first.locator("xpath=../.."),
-        page.locator("text=Credit Balance").first.locator("xpath=../../.."),
+        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
+        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
+        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[3]"),
     ]
 
-    for candidate in candidates:
+    for idx, card in enumerate(card_candidates, start=1):
         try:
-            if await candidate.count() > 0:
-                text = await candidate.inner_text()
-                parsed = parse_balance(text)
+            if await card.count() > 0:
+                text = await card.inner_text()
+                print(f"credit card candidate #{idx} =", text)
+                parsed = parse_balance_from_text(text)
                 if parsed:
                     return parsed
         except Exception:
             pass
 
-    return None
+    # 最後に全文
+    body_text = await get_body_text(page)
+    print("fallback body parse")
+    return parse_balance_from_text(body_text)
 
 
 async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
@@ -248,29 +200,22 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
         context = await browser.new_context()
         page = await context.new_page()
 
-        used_method = "unknown"
         after_login_url = ""
-
         try:
-            after_login_url = await login_if_needed(page, email, password)
-            used_method = await ensure_audio_page(page)
-
-            body_text = await get_body_text(page)
-            preview = body_text[:2000]
-
-            print("final url =", page.url)
-            print("final used_method =", used_method)
-            print("final preview =", preview[:1000])
+            after_login_url = await login(page, email, password)
+            audio_url = await open_audio_subscription(page)
 
             parsed = await extract_balance(page)
+            preview = await get_body_preview(page, 2000)
+
             if parsed:
                 return {
                     "ok": True,
                     "balanceText": parsed["balanceText"],
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
-                    "url": page.url,
-                    "used_method": used_method,
+                    "url": audio_url,
+                    "used_method": "login-basicinfo-audio-url",
                     "preview": preview,
                 }
 
@@ -279,7 +224,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": "balance text not matched on audio page",
                 "after_login_url": after_login_url,
                 "url": page.url,
-                "used_method": used_method,
+                "used_method": "login-basicinfo-audio-url",
                 "preview": preview,
             }
 
@@ -294,7 +239,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": str(e),
                 "after_login_url": after_login_url or page.url,
                 "url": page.url,
-                "used_method": used_method,
+                "used_method": "login-basicinfo-audio-url",
                 "preview": preview,
             }
 
@@ -308,7 +253,7 @@ async def root():
     return {
         "ok": True,
         "message": "MiniMax balance API is running",
-        "version": "2026-03-14-03",
+        "version": "2026-03-14-05",
     }
 
 
