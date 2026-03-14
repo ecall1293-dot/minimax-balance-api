@@ -7,7 +7,7 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-VERSION = "2026-03-14-09"
+VERSION = "2026-03-14-10"
 print(f"MINIMAX VERSION: {VERSION}")
 
 LOGIN_URL = "https://platform.minimax.io/login"
@@ -133,39 +133,39 @@ async def login(page, email: str, password: str, logs: List[str]) -> str:
     return page.url
 
 
-async def click_visible_text(page, text: str, logs: List[str]) -> None:
-    locator = page.get_by_text(text, exact=True)
-    count = await locator.count()
-    logs.append(f"visible text search '{text}' count={count}")
+async def js_click_menu_row(page, label: str, logs: List[str]) -> None:
+    """
+    テキスト自身ではなく、label を含む menu row の親 div.cursor-pointer を JS クリックする。
+    pointer-event の被りを回避するため、Playwright の通常 click ではなく DOM click を使う。
+    """
+    script = """
+    (label) => {
+      const all = Array.from(document.querySelectorAll('div.cursor-pointer'));
+      const row = all.find(el => {
+        const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        return t === label || t.includes(label);
+      });
+      if (!row) return { ok: false, reason: 'row not found' };
 
-    last_error = None
+      row.scrollIntoView({ block: 'center' });
+      row.click();
 
-    for i in range(count):
-        item = locator.nth(i)
-        try:
-            if not await item.is_visible():
-                continue
+      return {
+        ok: true,
+        text: (row.innerText || '').replace(/\\s+/g, ' ').trim()
+      };
+    }
+    """
+    result = await page.evaluate(script, label)
+    logs.append(f"js click '{label}' result={result}")
 
-            box = await item.bounding_box()
-            logs.append(f"'{text}' candidate #{i} visible box={box}")
+    if not result or not result.get("ok"):
+        raise Exception(f"menu row '{label}' not found or not clicked")
 
-            await item.scroll_into_view_if_needed()
-            await page.wait_for_timeout(300)
-
-            # まず普通にクリック
-            await item.click(timeout=5000)
-            logs.append(f"'{text}' clicked candidate #{i}")
-            await page.wait_for_timeout(2000)
-            return
-        except Exception as e:
-            last_error = e
-            logs.append(f"'{text}' candidate #{i} click failed: {str(e)}")
-
-    raise Exception(f"visible text '{text}' click failed: {last_error}")
+    await page.wait_for_timeout(2000)
 
 
 async def open_audio_by_sidebar(page, logs: List[str]) -> str:
-    # 基準ページを固定
     await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     logs.append(f"sidebar nav start url: {page.url}")
@@ -177,23 +177,23 @@ async def open_audio_by_sidebar(page, logs: List[str]) -> str:
     except Exception:
         logs.append("sidebar nav networkidle timeout")
 
-    # Subscribe は開いていることが多いが、念のため押す
+    # 念のため親メニューを押す
     try:
-        await click_visible_text(page, "Subscribe", logs)
+        await js_click_menu_row(page, "Subscribe", logs)
     except Exception as e:
-        logs.append(f"subscribe click skipped/failed: {str(e)}")
+        logs.append(f"subscribe js click skipped/failed: {str(e)}")
 
-    # Audio をクリック
-    await click_visible_text(page, "Audio", logs)
+    # Audio 行を親divごと JSクリック
+    await js_click_menu_row(page, "Audio", logs)
 
-    # Audio画面になるまで待つ
     for step in range(1, 11):
         current_url = page.url
-        preview = await get_body_preview(page, 900)
+        preview = await get_body_preview(page, 1000)
+        body_text = clean_text(await get_body_text(page))
+
         logs.append(f"after audio click step#{step} url={current_url}")
         logs.append(f"after audio click step#{step} preview={preview}")
 
-        body_text = clean_text(await get_body_text(page))
         if "Audio Subscription" in body_text and "Credit Balance" in body_text:
             logs.append("audio page detected by body markers")
             return page.url
@@ -291,7 +291,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
                     "url": current_url,
-                    "used_method": "login-basicinfo-sidebar-audio",
+                    "used_method": "login-basicinfo-sidebar-audio-jsclick",
                     "preview": preview,
                     "logs": logs,
                 }
@@ -301,7 +301,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": "balance text not matched on audio page",
                 "after_login_url": after_login_url,
                 "url": page.url,
-                "used_method": "login-basicinfo-sidebar-audio",
+                "used_method": "login-basicinfo-sidebar-audio-jsclick",
                 "preview": preview,
                 "logs": logs,
             }
@@ -316,7 +316,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": str(e),
                 "after_login_url": after_login_url or page.url,
                 "url": page.url,
-                "used_method": "login-basicinfo-sidebar-audio",
+                "used_method": "login-basicinfo-sidebar-audio-jsclick",
                 "preview": preview,
                 "logs": logs,
             }
