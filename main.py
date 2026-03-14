@@ -3,8 +3,17 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="minimax-balance-api")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
@@ -62,7 +71,6 @@ async def fetch_balance_direct() -> dict:
                 "ok": False,
                 "balance": None,
                 "reason": base_resp.get("status_msg", "unknown api error"),
-                "raw": data,
             }
 
         credit_info = data.get("credit_info") or {}
@@ -73,7 +81,6 @@ async def fetch_balance_direct() -> dict:
                 "ok": False,
                 "balance": None,
                 "reason": "credit_info.total_credit not found",
-                "raw": data,
             }
 
         return {
