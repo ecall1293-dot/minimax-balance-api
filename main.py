@@ -13,7 +13,6 @@ BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
 EMAIL = os.environ.get("MINIMAX_EMAIL", "")
 PASSWORD = os.environ.get("MINIMAX_PASSWORD", "")
 
-# Render では基本 True 推奨
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 STATE_FILE = "minimax_state.json"
 
@@ -94,12 +93,12 @@ async def login(page, logs: list[str]):
         'input[placeholder*="Email"]',
         'input[placeholder*="email"]',
         'input[name="email"]',
-        'input'
+        'input',
     ]
     password_selectors = [
         'input[type="password"]',
         'input[placeholder*="Password"]',
-        'input[placeholder*="password"]'
+        'input[placeholder*="password"]',
     ]
 
     email_input, email_selector = await wait_visible_any(page, email_selectors, timeout=15000)
@@ -322,4 +321,21 @@ async def health():
 
 @app.get("/balance")
 async def balance():
+    result = await fetch_balance()
+
+    if result.get("ok"):
+        return {
+            "ok": True,
+            "balance": int(result.get("balanceValue") or 0),
+        }
+
+    return {
+        "ok": False,
+        "balance": None,
+        "reason": result.get("reason", "unknown error"),
+    }
+
+
+@app.get("/balance/raw")
+async def balance_raw():
     return await fetch_balance()
