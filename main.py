@@ -1,175 +1,212 @@
+import asyncio
+import json
 import os
 import re
-from typing import Optional, Dict, Any, List
-
-from fastapi import FastAPI
-from playwright.async_api import async_playwright
-
-app = FastAPI()
-
-VERSION = "2026-03-14-10"
-print(f"MINIMAX VERSION: {VERSION}")
+from pathlib import Path
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 LOGIN_URL = "https://platform.minimax.io/login"
 BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
 
+EMAIL = os.environ.get("MINIMAX_EMAIL", "")
+PASSWORD = os.environ.get("MINIMAX_PASSWORD", "")
 
-def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+if not EMAIL or not PASSWORD:
+    raise RuntimeError("MINIMAX_EMAIL / MINIMAX_PASSWORD が設定されていません")
+
+HEADLESS = False
+STATE_FILE = "minimax_state.json"
 
 
-def parse_number(text: str) -> Optional[float]:
-    num = re.sub(r"[^\d.]", "", text or "")
-    if not num:
-        return None
+def parse_number(text: str):
     try:
-        return float(num)
-    except ValueError:
+        return float(text.replace(",", "").strip())
+    except Exception:
         return None
 
 
-async def get_body_text(page) -> str:
+async def get_body_preview(page, limit: int = 1200):
     try:
-        return await page.locator("body").inner_text()
+        text = await page.locator("body").inner_text()
+        text = re.sub(r"\s+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
+        return text[:limit]
     except Exception:
         return ""
 
 
-async def get_body_preview(page, limit: int = 1500) -> str:
-    return (await get_body_text(page))[:limit]
-
-
-async def wait_basic_info_ready(page, logs: List[str]) -> None:
-    await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
-    logs.append(f"basic-info url reached: {page.url}")
-
-    for text in ["Basic Information", "Email address", "GroupID", "Get Your Key"]:
+async def wait_visible_any(page, selectors, timeout=15000):
+    last_error = None
+    for selector in selectors:
         try:
-            await page.locator(f"text={text}").first.wait_for(state="visible", timeout=10000)
-            logs.append(f"basic-info marker visible: {text}")
-        except Exception:
-            logs.append(f"basic-info marker missing: {text}")
-
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-        logs.append("basic-info networkidle reached")
-    except Exception:
-        logs.append("basic-info networkidle timeout")
-
-    await page.wait_for_timeout(3000)
-    logs.append("basic-info extra wait done")
+            loc = page.locator(selector).first
+            await loc.wait_for(state="visible", timeout=timeout)
+            return loc, selector
+        except Exception as e:
+            last_error = e
+    raise last_error if last_error else Exception("No selector matched")
 
 
-async def login(page, email: str, password: str, logs: List[str]) -> str:
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
-    logs.append(f"login page url: {page.url}")
-
-    email_candidates = [
-        page.get_by_placeholder("Email").first,
-        page.locator('input[placeholder="Email"]').first,
-        page.locator('input[type="text"]').first,
-        page.locator('input[type="email"]').first,
-    ]
-
-    email_input = None
-    for idx, candidate in enumerate(email_candidates, start=1):
-        try:
-            await candidate.wait_for(state="visible", timeout=3000)
-            email_input = candidate
-            logs.append(f"email input matched candidate #{idx}")
-            break
-        except Exception:
-            pass
-
-    if email_input is None:
-        raise Exception(f"email input not found; preview={await get_body_preview(page)}")
-
-    password_candidates = [
-        page.locator('input[type="password"]').first,
-        page.locator('input[autocomplete="current-password"]').first,
-    ]
-
-    password_input = None
-    for idx, candidate in enumerate(password_candidates, start=1):
-        try:
-            await candidate.wait_for(state="visible", timeout=3000)
-            password_input = candidate
-            logs.append(f"password input matched candidate #{idx}")
-            break
-        except Exception:
-            pass
-
-    if password_input is None:
-        raise Exception(f"password input not found; preview={await get_body_preview(page)}")
-
-    await email_input.fill(email)
-    await password_input.fill(password)
-
-    sign_in_candidates = [
-        page.get_by_role("button", name="Sign in").first,
-        page.locator("button:has-text('Sign in')").first,
-    ]
-
-    sign_in_button = None
-    for idx, candidate in enumerate(sign_in_candidates, start=1):
-        try:
-            await candidate.wait_for(state="visible", timeout=3000)
-            sign_in_button = candidate
-            logs.append(f"sign in button matched candidate #{idx}")
-            break
-        except Exception:
-            pass
-
-    if sign_in_button is None:
-        raise Exception(f"sign in button not found; preview={await get_body_preview(page)}")
-
-    await sign_in_button.click()
-    logs.append("sign in clicked")
-
-    await wait_basic_info_ready(page, logs)
-    logs.append(f"after login final url: {page.url}")
-    logs.append(f"after login preview: {await get_body_preview(page, 800)}")
-    return page.url
-
-
-async def js_click_menu_row(page, label: str, logs: List[str]) -> None:
-    """
-    テキスト自身ではなく、label を含む menu row の親 div.cursor-pointer を JS クリックする。
-    pointer-event の被りを回避するため、Playwright の通常 click ではなく DOM click を使う。
-    """
+async def js_click_menu_row(page, label: str, logs: list[str]):
     script = """
     (label) => {
-      const all = Array.from(document.querySelectorAll('div.cursor-pointer'));
-      const row = all.find(el => {
-        const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        return t === label || t.includes(label);
-      });
-      if (!row) return { ok: false, reason: 'row not found' };
+      const nodes = Array.from(document.querySelectorAll("div, p, span, button, a"));
+      const target = nodes.find(el => (el.innerText || "").trim() === label);
+      if (!target) return { ok: false, reason: "not found" };
 
-      row.scrollIntoView({ block: 'center' });
-      row.click();
+      let clickable = target;
+      for (let i = 0; i < 6; i++) {
+        if (!clickable || !clickable.parentElement) break;
+        const style = window.getComputedStyle(clickable);
+        if (
+          clickable.tagName === "BUTTON" ||
+          clickable.tagName === "A" ||
+          clickable.onclick ||
+          style.cursor === "pointer"
+        ) {
+          break;
+        }
+        clickable = clickable.parentElement;
+      }
 
+      clickable.click();
       return {
         ok: true,
-        text: (row.innerText || '').replace(/\\s+/g, ' ').trim()
+        text: (clickable.innerText || "").trim()
       };
     }
     """
     result = await page.evaluate(script, label)
     logs.append(f"js click '{label}' result={result}")
+    if not result.get("ok"):
+        raise Exception(f"js click failed for {label}: {result}")
 
-    if not result or not result.get("ok"):
-        raise Exception(f"menu row '{label}' not found or not clicked")
+
+async def login(page, logs: list[str]):
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    logs.append(f"login page url: {page.url}")
+
+    email_selectors = [
+        'input[type="email"]',
+        'input[placeholder*="Email"]',
+        'input[placeholder*="email"]',
+        'input[name="email"]',
+        'input'
+    ]
+    password_selectors = [
+        'input[type="password"]',
+        'input[placeholder*="Password"]',
+        'input[placeholder*="password"]'
+    ]
+
+    email_input, email_selector = await wait_visible_any(page, email_selectors, timeout=15000)
+    logs.append(f"email input matched: {email_selector}")
+    await email_input.fill(EMAIL)
+
+    password_input, password_selector = await wait_visible_any(page, password_selectors, timeout=15000)
+    logs.append(f"password input matched: {password_selector}")
+    await password_input.fill(PASSWORD)
+
+    sign_in_candidates = [
+        page.get_by_role("button", name=re.compile(r"sign in", re.I)),
+        page.locator("button:has-text('Sign in')"),
+        page.locator("button"),
+    ]
+
+    clicked = False
+    for idx, candidate in enumerate(sign_in_candidates, start=1):
+        try:
+            if idx < 3:
+                await candidate.first.wait_for(state="visible", timeout=5000)
+                await candidate.first.click()
+                logs.append(f"sign in button matched candidate #{idx}")
+                clicked = True
+                break
+            else:
+                count = await candidate.count()
+                for i in range(count):
+                    text = (await candidate.nth(i).inner_text()).strip().lower()
+                    if "sign in" in text:
+                        await candidate.nth(i).click()
+                        logs.append(f"sign in button matched candidate #{idx}/{i}")
+                        clicked = True
+                        break
+                if clicked:
+                    break
+        except Exception as e:
+            logs.append(f"sign in candidate #{idx} failed: {e}")
+
+    if not clicked:
+        raise Exception("sign in button not found")
+
+    logs.append("sign in clicked")
+
+    try:
+        await page.wait_for_url(re.compile(r"/user-center/basic-information"), timeout=20000)
+        logs.append(f"basic-info url reached: {page.url}")
+    except PlaywrightTimeoutError:
+        logs.append(f"basic-info url wait timeout, current={page.url}")
+
+    basic_markers = ["Basic Information", "Email address", "GroupID", "Get Your Key"]
+    for marker in basic_markers:
+        try:
+            await page.get_by_text(marker, exact=False).first.wait_for(state="visible", timeout=8000)
+            logs.append(f"basic-info marker visible: {marker}")
+        except Exception:
+            logs.append(f"basic-info marker missing: {marker}")
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8000)
+        logs.append("basic-info networkidle reached")
+    except Exception:
+        logs.append("basic-info networkidle timeout")
 
     await page.wait_for_timeout(2000)
+    logs.append("basic-info extra wait done")
+    logs.append(f"after login final url: {page.url}")
+    logs.append(f"after login preview: {await get_body_preview(page, 1200)}")
 
 
-async def open_audio_by_sidebar(page, logs: List[str]) -> str:
+async def extract_balance(page, logs: list[str], tag: str = ""):
+    try:
+        locator = page.locator("div:has(span:text('Credit Balance'))").first
+        if await locator.count() > 0:
+            text = await locator.inner_text()
+            logs.append(f"{tag} balance card text={text}")
+
+            value_locator = locator.locator("span.text-\\[16px\\].font-\\[500\\].text-\\[\\#181E25\\]").last
+            if await value_locator.count() > 0:
+                raw = (await value_locator.inner_text()).strip()
+                if re.fullmatch(r"[0-9][0-9,]*", raw):
+                    return {
+                        "balanceText": raw,
+                        "balanceValue": parse_number(raw),
+                    }
+    except Exception as e:
+        logs.append(f"{tag} direct balance parse failed: {e}")
+
+    try:
+        body = await page.locator("body").inner_text()
+        m = re.search(r"Credit Balance.*?([0-9][0-9,]*)", body, re.S)
+        if m:
+            raw = m.group(1).strip()
+            logs.append(f"{tag} fallback matched balance={raw}")
+            return {
+                "balanceText": raw,
+                "balanceValue": parse_number(raw),
+            }
+    except Exception as e:
+        logs.append(f"{tag} fallback parse failed: {e}")
+
+    return None
+
+
+async def open_audio_and_capture_balance(page, logs: list[str]):
     await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     logs.append(f"sidebar nav start url: {page.url}")
-    logs.append(f"sidebar nav start preview: {await get_body_preview(page, 700)}")
+    logs.append(f"sidebar nav start preview: {await get_body_preview(page, 1200)}")
 
     try:
         await page.wait_for_load_state("networkidle", timeout=8000)
@@ -177,173 +214,88 @@ async def open_audio_by_sidebar(page, logs: List[str]) -> str:
     except Exception:
         logs.append("sidebar nav networkidle timeout")
 
-    # 念のため親メニューを押す
     try:
         await js_click_menu_row(page, "Subscribe", logs)
     except Exception as e:
-        logs.append(f"subscribe js click skipped/failed: {str(e)}")
+        logs.append(f"subscribe js click skipped/failed: {e}")
 
-    # Audio 行を親divごと JSクリック
     await js_click_menu_row(page, "Audio", logs)
 
     for step in range(1, 11):
         current_url = page.url
-        preview = await get_body_preview(page, 1000)
-        body_text = clean_text(await get_body_text(page))
-
+        preview = await get_body_preview(page, 1500)
         logs.append(f"after audio click step#{step} url={current_url}")
         logs.append(f"after audio click step#{step} preview={preview}")
 
-        if "Audio Subscription" in body_text and "Credit Balance" in body_text:
-            logs.append("audio page detected by body markers")
-            return page.url
+        parsed = await extract_balance(page, logs, tag=f"step#{step}")
+        if parsed:
+            logs.append(f"balance captured at step#{step}")
+            return {
+                "url": current_url,
+                "balanceText": parsed["balanceText"],
+                "balanceValue": parsed["balanceValue"],
+                "preview": preview,
+            }
 
         await page.wait_for_timeout(1000)
 
-    raise Exception(f"audio page not reached by sidebar; current url={page.url}")
+    raise Exception(f"balance not captured after audio click; current url={page.url}")
 
 
-async def extract_balance(page, logs: List[str]) -> Optional[Dict[str, Any]]:
-    candidates = [
-        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
-        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
-        page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[3]"),
-        page.locator("div:has-text('Credit Balance')").first,
-    ]
-
-    for idx, candidate in enumerate(candidates, start=1):
-        try:
-            if await candidate.count() == 0:
-                continue
-
-            text = clean_text(await candidate.inner_text())
-            logs.append(f"balance candidate #{idx}: {text}")
-
-            m = re.search(
-                r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
-                text,
-                re.I,
-            )
-            if m:
-                raw = m.group(1).strip()
-                return {
-                    "balanceText": raw,
-                    "balanceValue": parse_number(raw),
-                }
-
-            spans = candidate.locator("span")
-            span_count = await spans.count()
-            for i in range(span_count):
-                span_text = clean_text(await spans.nth(i).inner_text())
-                if re.fullmatch(r"[0-9][0-9,]*(?:\.\d+)?", span_text):
-                    return {
-                        "balanceText": span_text,
-                        "balanceValue": parse_number(span_text),
-                    }
-        except Exception:
-            pass
-
-    body_text = clean_text(await get_body_text(page))
-    logs.append("fallback body parse used")
-
-    for pattern in [
-        r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
-        r"Credit Balance.*?([0-9][0-9,]*(?:\.\d+)?)",
-    ]:
-        m = re.search(pattern, body_text, re.I)
-        if m:
-            raw = m.group(1).strip()
-            return {
-                "balanceText": raw,
-                "balanceValue": parse_number(raw),
-            }
-
-    return None
-
-
-async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
-    logs: List[str] = []
+async def main():
+    logs = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        browser = await p.chromium.launch(headless=HEADLESS)
         context = await browser.new_context()
+
+        state_path = Path(STATE_FILE)
+        if state_path.exists():
+            try:
+                await context.add_cookies(json.loads(state_path.read_text(encoding="utf-8")))
+                logs.append("existing cookies loaded")
+            except Exception as e:
+                logs.append(f"cookie load failed: {e}")
+
         page = await context.new_page()
 
-        after_login_url = ""
-
         try:
-            after_login_url = await login(page, email, password, logs)
-            current_url = await open_audio_by_sidebar(page, logs)
+            await login(page, logs)
 
-            parsed = await extract_balance(page, logs)
-            preview = await get_body_preview(page, 2000)
+            try:
+                cookies = await context.cookies()
+                state_path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+                logs.append("cookies saved")
+            except Exception as e:
+                logs.append(f"cookie save failed: {e}")
 
-            if parsed:
-                return {
-                    "ok": True,
-                    "balanceText": parsed["balanceText"],
-                    "balanceValue": parsed["balanceValue"],
-                    "after_login_url": after_login_url,
-                    "url": current_url,
-                    "used_method": "login-basicinfo-sidebar-audio-jsclick",
-                    "preview": preview,
-                    "logs": logs,
-                }
+            result = await open_audio_and_capture_balance(page, logs)
 
-            return {
-                "ok": False,
-                "reason": "balance text not matched on audio page",
-                "after_login_url": after_login_url,
-                "url": page.url,
-                "used_method": "login-basicinfo-sidebar-audio-jsclick",
-                "preview": preview,
+            output = {
+                "ok": True,
+                "balanceText": result["balanceText"],
+                "balanceValue": result["balanceValue"],
+                "url": result["url"],
+                "used_method": "login-basicinfo-sidebar-audio-capture-early",
+                "preview": result["preview"],
                 "logs": logs,
             }
+            print(json.dumps(output, ensure_ascii=False, indent=2))
 
         except Exception as e:
-            preview = await get_body_preview(page, 2000)
-            logs.append(f"exception: {str(e)}")
-            logs.append(f"exception url: {page.url}")
-
-            return {
+            output = {
                 "ok": False,
                 "reason": str(e),
-                "after_login_url": after_login_url or page.url,
                 "url": page.url,
-                "used_method": "login-basicinfo-sidebar-audio-jsclick",
-                "preview": preview,
+                "preview": await get_body_preview(page, 2000),
                 "logs": logs,
             }
+            print(json.dumps(output, ensure_ascii=False, indent=2))
 
         finally:
             await context.close()
             await browser.close()
 
 
-@app.get("/")
-async def root():
-    return {
-        "ok": True,
-        "message": "MiniMax balance API is running",
-        "version": VERSION,
-    }
-
-
-@app.get("/balance")
-async def balance():
-    email = os.getenv("MINIMAX_EMAIL", "").strip()
-    password = os.getenv("MINIMAX_PASSWORD", "").strip()
-
-    if not email or not password:
-        return {
-            "ok": False,
-            "reason": "MINIMAX_EMAIL or MINIMAX_PASSWORD is not set",
-        }
-
-    return await fetch_minimax_balance(email, password)
+if __name__ == "__main__":
+    asyncio.run(main())
