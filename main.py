@@ -3,11 +3,11 @@ import re
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 app = FastAPI()
 
-VERSION = "2026-03-14-06"
+VERSION = "2026-03-14-07"
 print(f"MINIMAX VERSION: {VERSION}")
 
 LOGIN_URL = "https://platform.minimax.io/login"
@@ -20,9 +20,7 @@ def clean_text(text: str) -> str:
 
 
 def parse_number(text: str) -> Optional[float]:
-    if not text:
-        return None
-    num = re.sub(r"[^\d.]", "", text)
+    num = re.sub(r"[^\d.]", "", text or "")
     if not num:
         return None
     try:
@@ -114,17 +112,32 @@ async def login(page, email: str, password: str) -> str:
     await sign_in_button.click()
 
     await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
-    await page.wait_for_timeout(2500)
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(2000)
 
     print("after login url =", page.url)
+    print("after login preview =", await get_body_preview(page, 1000))
     return page.url
 
 
-async def open_audio_subscription(page) -> str:
+async def open_audio_subscription_in_new_tab(context) -> Any:
+    page = await context.new_page()
+
+    # まず basic-information を一度開いて認証済み状態を安定させる
+    await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1500)
+
+    print("new tab basic-info url =", page.url)
+    print("new tab basic-info preview =", await get_body_preview(page, 800))
+
+    # その後 audio を直開き
     await page.goto(AUDIO_URL, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(2500)
 
     print("after goto audio url =", page.url)
+    print("after goto audio preview =", await get_body_preview(page, 1200))
 
     await page.locator("text=Audio Subscription").first.wait_for(
         state="visible",
@@ -135,37 +148,30 @@ async def open_audio_subscription(page) -> str:
         timeout=15000,
     )
 
-    preview = await get_body_preview(page, 1200)
-    print("audio page preview =", preview)
-
-    return page.url
+    return page
 
 
 async def extract_balance(page) -> Optional[Dict[str, Any]]:
-    # まずユーザーが貼ってくれた構造に寄せて取得
-    # <div class="flex justify-between items-baseline mt-[16px]"> ... </div>
-    #   左側: Credit Balance
-    #   右側: <span>99,728</span>
-    #
-    # Tailwind の class は [] を含むので使わず、テキスト起点で祖先から拾う。
-
-    card_candidates = [
+    candidates = [
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[3]"),
         page.locator("div:has-text('Credit Balance')").first,
     ]
 
-    for idx, card in enumerate(card_candidates, start=1):
+    for idx, candidate in enumerate(candidates, start=1):
         try:
-            if await card.count() == 0:
+            if await candidate.count() == 0:
                 continue
 
-            card_text = await card.inner_text()
-            print(f"card candidate #{idx} text =", card_text)
+            text = clean_text(await candidate.inner_text())
+            print(f"card candidate #{idx} =", text)
 
-            # まず card 全体から直接パース
-            m = re.search(r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)", clean_text(card_text), re.I)
+            m = re.search(
+                r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+                text,
+                re.I,
+            )
             if m:
                 raw = m.group(1).strip()
                 return {
@@ -173,31 +179,26 @@ async def extract_balance(page) -> Optional[Dict[str, Any]]:
                     "balanceValue": parse_number(raw),
                 }
 
-            # 右端 span を拾ってみる
-            spans = card.locator("span")
-            count = await spans.count()
-            for i in range(count):
-                txt = clean_text(await spans.nth(i).inner_text())
-                if re.fullmatch(r"[0-9][0-9,]*(?:\.\d+)?", txt):
+            spans = candidate.locator("span")
+            span_count = await spans.count()
+            for i in range(span_count):
+                span_text = clean_text(await spans.nth(i).inner_text())
+                if re.fullmatch(r"[0-9][0-9,]*(?:\.\d+)?", span_text):
                     return {
-                        "balanceText": txt,
-                        "balanceValue": parse_number(txt),
+                        "balanceText": span_text,
+                        "balanceValue": parse_number(span_text),
                     }
         except Exception:
             pass
 
-    # 最後に全文からフォールバック
-    body_text = await get_body_text(page)
-    normalized = clean_text(body_text)
+    body_text = clean_text(await get_body_text(page))
     print("fallback body parse")
 
-    patterns = [
+    for pattern in [
         r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
         r"Credit Balance.*?([0-9][0-9,]*(?:\.\d+)?)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, normalized, re.I)
+    ]:
+        m = re.search(pattern, body_text, re.I)
         if m:
             raw = m.group(1).strip()
             return {
@@ -217,17 +218,19 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "--disable-dev-shm-usage",
             ],
         )
+
         context = await browser.new_context()
-        page = await context.new_page()
+        login_page = await context.new_page()
 
         after_login_url = ""
 
         try:
-            after_login_url = await login(page, email, password)
-            current_url = await open_audio_subscription(page)
+            after_login_url = await login(login_page, email, password)
 
-            parsed = await extract_balance(page)
-            preview = await get_body_preview(page, 2000)
+            audio_page = await open_audio_subscription_in_new_tab(context)
+
+            parsed = await extract_balance(audio_page)
+            preview = await get_body_preview(audio_page, 2000)
 
             if parsed:
                 return {
@@ -235,8 +238,8 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                     "balanceText": parsed["balanceText"],
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
-                    "url": current_url,
-                    "used_method": "login-basicinfo-audio-url",
+                    "url": audio_page.url,
+                    "used_method": "login-basicinfo-newtab-audio-url",
                     "preview": preview,
                 }
 
@@ -244,23 +247,28 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "ok": False,
                 "reason": "balance text not matched on audio page",
                 "after_login_url": after_login_url,
-                "url": page.url,
-                "used_method": "login-basicinfo-audio-url",
+                "url": audio_page.url,
+                "used_method": "login-basicinfo-newtab-audio-url",
                 "preview": preview,
             }
 
         except Exception as e:
-            preview = await get_body_preview(page, 2000)
+            preview = ""
+            try:
+                preview = await get_body_preview(login_page, 2000)
+            except Exception:
+                pass
+
             print("exception =", str(e))
-            print("exception url =", page.url)
+            print("exception url =", login_page.url)
             print("exception preview =", preview[:1000])
 
             return {
                 "ok": False,
                 "reason": str(e),
-                "after_login_url": after_login_url or page.url,
-                "url": page.url,
-                "used_method": "login-basicinfo-audio-url",
+                "after_login_url": after_login_url or login_page.url,
+                "url": login_page.url,
+                "used_method": "login-basicinfo-newtab-audio-url",
                 "preview": preview,
             }
 
