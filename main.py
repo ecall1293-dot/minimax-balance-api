@@ -7,12 +7,11 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-VERSION = "2026-03-14-08"
+VERSION = "2026-03-14-09"
 print(f"MINIMAX VERSION: {VERSION}")
 
 LOGIN_URL = "https://platform.minimax.io/login"
 BASIC_INFO_URL = "https://platform.minimax.io/user-center/basic-information"
-AUDIO_URL = "https://platform.minimax.io/user-center/payment/audio-subscription"
 
 
 def clean_text(text: str) -> str:
@@ -44,7 +43,6 @@ async def wait_basic_info_ready(page, logs: List[str]) -> None:
     await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
     logs.append(f"basic-info url reached: {page.url}")
 
-    # 画面の主要要素が見えるまで待つ
     for text in ["Basic Information", "Email address", "GroupID", "Get Your Key"]:
         try:
             await page.locator(f"text={text}").first.wait_for(state="visible", timeout=10000)
@@ -52,14 +50,13 @@ async def wait_basic_info_ready(page, logs: List[str]) -> None:
         except Exception:
             logs.append(f"basic-info marker missing: {text}")
 
-    # 初期化待ち
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
         logs.append("basic-info networkidle reached")
     except Exception:
         logs.append("basic-info networkidle timeout")
 
-    await page.wait_for_timeout(5000)
+    await page.wait_for_timeout(3000)
     logs.append("basic-info extra wait done")
 
 
@@ -86,8 +83,7 @@ async def login(page, email: str, password: str, logs: List[str]) -> str:
             pass
 
     if email_input is None:
-        preview = await get_body_preview(page)
-        raise Exception(f"email input not found; preview={preview}")
+        raise Exception(f"email input not found; preview={await get_body_preview(page)}")
 
     password_candidates = [
         page.locator('input[type="password"]').first,
@@ -105,8 +101,7 @@ async def login(page, email: str, password: str, logs: List[str]) -> str:
             pass
 
     if password_input is None:
-        preview = await get_body_preview(page)
-        raise Exception(f"password input not found; preview={preview}")
+        raise Exception(f"password input not found; preview={await get_body_preview(page)}")
 
     await email_input.fill(email)
     await password_input.fill(password)
@@ -127,73 +122,88 @@ async def login(page, email: str, password: str, logs: List[str]) -> str:
             pass
 
     if sign_in_button is None:
-        preview = await get_body_preview(page)
-        raise Exception(f"sign in button not found; preview={preview}")
+        raise Exception(f"sign in button not found; preview={await get_body_preview(page)}")
 
     await sign_in_button.click()
     logs.append("sign in clicked")
 
     await wait_basic_info_ready(page, logs)
     logs.append(f"after login final url: {page.url}")
+    logs.append(f"after login preview: {await get_body_preview(page, 800)}")
     return page.url
 
 
-async def try_open_audio(page, logs: List[str]) -> bool:
-    body = await get_body_text(page)
-    body_clean = clean_text(body)
+async def click_visible_text(page, text: str, logs: List[str]) -> None:
+    locator = page.get_by_text(text, exact=True)
+    count = await locator.count()
+    logs.append(f"visible text search '{text}' count={count}")
 
-    if "Audio Subscription" in body_clean and "Credit Balance" in body_clean:
-        logs.append("audio markers found in body")
-        return True
+    last_error = None
 
-    if AUDIO_URL in page.url and "Credit Balance" in body_clean:
-        logs.append("audio url and credit balance found")
-        return True
-
-    return False
-
-
-async def open_audio_subscription(page, logs: List[str]) -> str:
-    # いきなり1回で決めに行かず、安定化込みで複数回試す
-    for attempt in range(1, 4):
-        logs.append(f"audio attempt #{attempt} start from url={page.url}")
-
-        # 一度 basic-info を明示して土台を揃える
-        await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        logs.append(f"audio attempt #{attempt} basic-info reload url={page.url}")
-
+    for i in range(count):
+        item = locator.nth(i)
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-            logs.append(f"audio attempt #{attempt} basic-info networkidle ok")
-        except Exception:
-            logs.append(f"audio attempt #{attempt} basic-info networkidle timeout")
+            if not await item.is_visible():
+                continue
 
-        await page.wait_for_timeout(2500)
+            box = await item.bounding_box()
+            logs.append(f"'{text}' candidate #{i} visible box={box}")
 
-        # 1. 普通の goto
-        await page.goto(AUDIO_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000 + attempt * 1000)
-        logs.append(f"audio attempt #{attempt} after goto url={page.url}")
-        logs.append(f"audio attempt #{attempt} preview after goto={(await get_body_preview(page, 700))}")
+            await item.scroll_into_view_if_needed()
+            await page.wait_for_timeout(300)
 
-        if await try_open_audio(page, logs):
+            # まず普通にクリック
+            await item.click(timeout=5000)
+            logs.append(f"'{text}' clicked candidate #{i}")
+            await page.wait_for_timeout(2000)
+            return
+        except Exception as e:
+            last_error = e
+            logs.append(f"'{text}' candidate #{i} click failed: {str(e)}")
+
+    raise Exception(f"visible text '{text}' click failed: {last_error}")
+
+
+async def open_audio_by_sidebar(page, logs: List[str]) -> str:
+    # 基準ページを固定
+    await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    logs.append(f"sidebar nav start url: {page.url}")
+    logs.append(f"sidebar nav start preview: {await get_body_preview(page, 700)}")
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8000)
+        logs.append("sidebar nav networkidle ok")
+    except Exception:
+        logs.append("sidebar nav networkidle timeout")
+
+    # Subscribe は開いていることが多いが、念のため押す
+    try:
+        await click_visible_text(page, "Subscribe", logs)
+    except Exception as e:
+        logs.append(f"subscribe click skipped/failed: {str(e)}")
+
+    # Audio をクリック
+    await click_visible_text(page, "Audio", logs)
+
+    # Audio画面になるまで待つ
+    for step in range(1, 11):
+        current_url = page.url
+        preview = await get_body_preview(page, 900)
+        logs.append(f"after audio click step#{step} url={current_url}")
+        logs.append(f"after audio click step#{step} preview={preview}")
+
+        body_text = clean_text(await get_body_text(page))
+        if "Audio Subscription" in body_text and "Credit Balance" in body_text:
+            logs.append("audio page detected by body markers")
             return page.url
 
-        # 2. location.href でもう一押し
-        await page.evaluate(f"window.location.href = '{AUDIO_URL}'")
-        await page.wait_for_timeout(4000 + attempt * 1000)
-        logs.append(f"audio attempt #{attempt} after location.href url={page.url}")
-        logs.append(f"audio attempt #{attempt} preview after location.href={(await get_body_preview(page, 700))}")
+        await page.wait_for_timeout(1000)
 
-        if await try_open_audio(page, logs):
-            return page.url
-
-    raise Exception(f"audio page not reached after retries; current url={page.url}")
+    raise Exception(f"audio page not reached by sidebar; current url={page.url}")
 
 
 async def extract_balance(page, logs: List[str]) -> Optional[Dict[str, Any]]:
-    # 貼ってもらった Credit Balance のDOM構造に寄せて取得
     candidates = [
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
@@ -233,7 +243,6 @@ async def extract_balance(page, logs: List[str]) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # 全文フォールバック
     body_text = clean_text(await get_body_text(page))
     logs.append("fallback body parse used")
 
@@ -270,7 +279,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
 
         try:
             after_login_url = await login(page, email, password, logs)
-            current_url = await open_audio_subscription(page, logs)
+            current_url = await open_audio_by_sidebar(page, logs)
 
             parsed = await extract_balance(page, logs)
             preview = await get_body_preview(page, 2000)
@@ -282,7 +291,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
                     "url": current_url,
-                    "used_method": "login-basicinfo-audio-retry",
+                    "used_method": "login-basicinfo-sidebar-audio",
                     "preview": preview,
                     "logs": logs,
                 }
@@ -292,7 +301,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": "balance text not matched on audio page",
                 "after_login_url": after_login_url,
                 "url": page.url,
-                "used_method": "login-basicinfo-audio-retry",
+                "used_method": "login-basicinfo-sidebar-audio",
                 "preview": preview,
                 "logs": logs,
             }
@@ -307,7 +316,7 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "reason": str(e),
                 "after_login_url": after_login_url or page.url,
                 "url": page.url,
-                "used_method": "login-basicinfo-audio-retry",
+                "used_method": "login-basicinfo-sidebar-audio",
                 "preview": preview,
                 "logs": logs,
             }
