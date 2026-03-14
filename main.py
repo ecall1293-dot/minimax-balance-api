@@ -1,13 +1,13 @@
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-VERSION = "2026-03-14-07"
+VERSION = "2026-03-14-08"
 print(f"MINIMAX VERSION: {VERSION}")
 
 LOGIN_URL = "https://platform.minimax.io/login"
@@ -37,15 +37,36 @@ async def get_body_text(page) -> str:
 
 
 async def get_body_preview(page, limit: int = 1500) -> str:
-    text = await get_body_text(page)
-    return text[:limit]
+    return (await get_body_text(page))[:limit]
 
 
-async def login(page, email: str, password: str) -> str:
+async def wait_basic_info_ready(page, logs: List[str]) -> None:
+    await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
+    logs.append(f"basic-info url reached: {page.url}")
+
+    # 画面の主要要素が見えるまで待つ
+    for text in ["Basic Information", "Email address", "GroupID", "Get Your Key"]:
+        try:
+            await page.locator(f"text={text}").first.wait_for(state="visible", timeout=10000)
+            logs.append(f"basic-info marker visible: {text}")
+        except Exception:
+            logs.append(f"basic-info marker missing: {text}")
+
+    # 初期化待ち
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+        logs.append("basic-info networkidle reached")
+    except Exception:
+        logs.append("basic-info networkidle timeout")
+
+    await page.wait_for_timeout(5000)
+    logs.append("basic-info extra wait done")
+
+
+async def login(page, email: str, password: str, logs: List[str]) -> str:
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
-
-    print("login url =", page.url)
+    logs.append(f"login page url: {page.url}")
 
     email_candidates = [
         page.get_by_placeholder("Email").first,
@@ -59,7 +80,7 @@ async def login(page, email: str, password: str) -> str:
         try:
             await candidate.wait_for(state="visible", timeout=3000)
             email_input = candidate
-            print(f"email input matched candidate #{idx}")
+            logs.append(f"email input matched candidate #{idx}")
             break
         except Exception:
             pass
@@ -78,7 +99,7 @@ async def login(page, email: str, password: str) -> str:
         try:
             await candidate.wait_for(state="visible", timeout=3000)
             password_input = candidate
-            print(f"password input matched candidate #{idx}")
+            logs.append(f"password input matched candidate #{idx}")
             break
         except Exception:
             pass
@@ -100,7 +121,7 @@ async def login(page, email: str, password: str) -> str:
         try:
             await candidate.wait_for(state="visible", timeout=3000)
             sign_in_button = candidate
-            print(f"sign in button matched candidate #{idx}")
+            logs.append(f"sign in button matched candidate #{idx}")
             break
         except Exception:
             pass
@@ -110,48 +131,69 @@ async def login(page, email: str, password: str) -> str:
         raise Exception(f"sign in button not found; preview={preview}")
 
     await sign_in_button.click()
+    logs.append("sign in clicked")
 
-    await page.wait_for_url("**/user-center/basic-information**", timeout=20000)
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2000)
-
-    print("after login url =", page.url)
-    print("after login preview =", await get_body_preview(page, 1000))
+    await wait_basic_info_ready(page, logs)
+    logs.append(f"after login final url: {page.url}")
     return page.url
 
 
-async def open_audio_subscription_in_new_tab(context) -> Any:
-    page = await context.new_page()
+async def try_open_audio(page, logs: List[str]) -> bool:
+    body = await get_body_text(page)
+    body_clean = clean_text(body)
 
-    # まず basic-information を一度開いて認証済み状態を安定させる
-    await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(1500)
+    if "Audio Subscription" in body_clean and "Credit Balance" in body_clean:
+        logs.append("audio markers found in body")
+        return True
 
-    print("new tab basic-info url =", page.url)
-    print("new tab basic-info preview =", await get_body_preview(page, 800))
+    if AUDIO_URL in page.url and "Credit Balance" in body_clean:
+        logs.append("audio url and credit balance found")
+        return True
 
-    # その後 audio を直開き
-    await page.goto(AUDIO_URL, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2500)
-
-    print("after goto audio url =", page.url)
-    print("after goto audio preview =", await get_body_preview(page, 1200))
-
-    await page.locator("text=Audio Subscription").first.wait_for(
-        state="visible",
-        timeout=15000,
-    )
-    await page.locator("text=Credit Balance").first.wait_for(
-        state="visible",
-        timeout=15000,
-    )
-
-    return page
+    return False
 
 
-async def extract_balance(page) -> Optional[Dict[str, Any]]:
+async def open_audio_subscription(page, logs: List[str]) -> str:
+    # いきなり1回で決めに行かず、安定化込みで複数回試す
+    for attempt in range(1, 4):
+        logs.append(f"audio attempt #{attempt} start from url={page.url}")
+
+        # 一度 basic-info を明示して土台を揃える
+        await page.goto(BASIC_INFO_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        logs.append(f"audio attempt #{attempt} basic-info reload url={page.url}")
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+            logs.append(f"audio attempt #{attempt} basic-info networkidle ok")
+        except Exception:
+            logs.append(f"audio attempt #{attempt} basic-info networkidle timeout")
+
+        await page.wait_for_timeout(2500)
+
+        # 1. 普通の goto
+        await page.goto(AUDIO_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000 + attempt * 1000)
+        logs.append(f"audio attempt #{attempt} after goto url={page.url}")
+        logs.append(f"audio attempt #{attempt} preview after goto={(await get_body_preview(page, 700))}")
+
+        if await try_open_audio(page, logs):
+            return page.url
+
+        # 2. location.href でもう一押し
+        await page.evaluate(f"window.location.href = '{AUDIO_URL}'")
+        await page.wait_for_timeout(4000 + attempt * 1000)
+        logs.append(f"audio attempt #{attempt} after location.href url={page.url}")
+        logs.append(f"audio attempt #{attempt} preview after location.href={(await get_body_preview(page, 700))}")
+
+        if await try_open_audio(page, logs):
+            return page.url
+
+    raise Exception(f"audio page not reached after retries; current url={page.url}")
+
+
+async def extract_balance(page, logs: List[str]) -> Optional[Dict[str, Any]]:
+    # 貼ってもらった Credit Balance のDOM構造に寄せて取得
     candidates = [
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[1]"),
         page.locator("text=Credit Balance").first.locator("xpath=ancestor::div[2]"),
@@ -165,7 +207,7 @@ async def extract_balance(page) -> Optional[Dict[str, Any]]:
                 continue
 
             text = clean_text(await candidate.inner_text())
-            print(f"card candidate #{idx} =", text)
+            logs.append(f"balance candidate #{idx}: {text}")
 
             m = re.search(
                 r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
@@ -191,8 +233,9 @@ async def extract_balance(page) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
+    # 全文フォールバック
     body_text = clean_text(await get_body_text(page))
-    print("fallback body parse")
+    logs.append("fallback body parse used")
 
     for pattern in [
         r"Credit Balance\s*(?:Balance Alert)?\s*([0-9][0-9,]*(?:\.\d+)?)",
@@ -210,6 +253,8 @@ async def extract_balance(page) -> Optional[Dict[str, Any]]:
 
 
 async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
+    logs: List[str] = []
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -218,19 +263,17 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                 "--disable-dev-shm-usage",
             ],
         )
-
         context = await browser.new_context()
-        login_page = await context.new_page()
+        page = await context.new_page()
 
         after_login_url = ""
 
         try:
-            after_login_url = await login(login_page, email, password)
+            after_login_url = await login(page, email, password, logs)
+            current_url = await open_audio_subscription(page, logs)
 
-            audio_page = await open_audio_subscription_in_new_tab(context)
-
-            parsed = await extract_balance(audio_page)
-            preview = await get_body_preview(audio_page, 2000)
+            parsed = await extract_balance(page, logs)
+            preview = await get_body_preview(page, 2000)
 
             if parsed:
                 return {
@@ -238,38 +281,35 @@ async def fetch_minimax_balance(email: str, password: str) -> Dict[str, Any]:
                     "balanceText": parsed["balanceText"],
                     "balanceValue": parsed["balanceValue"],
                     "after_login_url": after_login_url,
-                    "url": audio_page.url,
-                    "used_method": "login-basicinfo-newtab-audio-url",
+                    "url": current_url,
+                    "used_method": "login-basicinfo-audio-retry",
                     "preview": preview,
+                    "logs": logs,
                 }
 
             return {
                 "ok": False,
                 "reason": "balance text not matched on audio page",
                 "after_login_url": after_login_url,
-                "url": audio_page.url,
-                "used_method": "login-basicinfo-newtab-audio-url",
+                "url": page.url,
+                "used_method": "login-basicinfo-audio-retry",
                 "preview": preview,
+                "logs": logs,
             }
 
         except Exception as e:
-            preview = ""
-            try:
-                preview = await get_body_preview(login_page, 2000)
-            except Exception:
-                pass
-
-            print("exception =", str(e))
-            print("exception url =", login_page.url)
-            print("exception preview =", preview[:1000])
+            preview = await get_body_preview(page, 2000)
+            logs.append(f"exception: {str(e)}")
+            logs.append(f"exception url: {page.url}")
 
             return {
                 "ok": False,
                 "reason": str(e),
-                "after_login_url": after_login_url or login_page.url,
-                "url": login_page.url,
-                "used_method": "login-basicinfo-newtab-audio-url",
+                "after_login_url": after_login_url or page.url,
+                "url": page.url,
+                "used_method": "login-basicinfo-audio-retry",
                 "preview": preview,
+                "logs": logs,
             }
 
         finally:
